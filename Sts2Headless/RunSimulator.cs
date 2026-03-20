@@ -291,31 +291,31 @@ public class RunSimulator
         _turnStarted.Reset();
         _combatEnded.Reset();
 
-        // Suppress Task.Yield() during end-turn to force synchronous execution
-        YieldPatches.SuppressYield = true;
-        try
-        {
-            PlayerCmd.EndTurn(player, canBackOut: false);
-            _syncCtx.Pump();
-        }
-        finally
-        {
-            YieldPatches.SuppressYield = false;
-        }
+        // EndTurn triggers async chain with Task.Yield() on ThreadPool.
+        // We poll for state change to detect completion.
+        var prevHp = player.Creature.CurrentHp;
+        var prevEnemyHp = CombatManager.Instance.DebugOnlyGetState()?.Enemies?
+            .Where(e => e != null && e.IsAlive).Sum(e => e.CurrentHp) ?? 0;
+        var prevRound = CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0;
 
-        // Brief fallback wait if the sync context didn't capture everything
-        if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase
-            && !player.Creature.IsDead)
+        PlayerCmd.EndTurn(player, canBackOut: false);
+        _syncCtx.Pump();
+
+        // Wait for turn transition — detect by state changes
+        for (int i = 0; i < 200; i++)
         {
-            // Wait up to 2s for ThreadPool stragglers
-            for (int i = 0; i < 100; i++)
-            {
-                _syncCtx.Pump();
-                if (_turnStarted.IsSet || _combatEnded.IsSet) break;
-                if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                if (CombatManager.Instance.IsPlayPhase) break;
-                Thread.Sleep(20);
-            }
+            _syncCtx.Pump();
+            if (_turnStarted.IsSet || _combatEnded.IsSet) break;
+            if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
+
+            var curRound = CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0;
+            if (curRound > prevRound) break;
+
+            // Also detect state change by HP change (enemy turn happened)
+            var curHp = player.Creature.CurrentHp;
+            if (curHp != prevHp) { Thread.Sleep(50); _syncCtx.Pump(); break; }
+
+            Thread.Sleep(5);
         }
 
         return DetectDecisionPoint();
@@ -919,8 +919,8 @@ public class RunSimulator
         try { SaveManager.Instance.InitProgressData(); }
         catch (Exception ex) { Console.Error.WriteLine($"[WARN] InitProgressData: {ex.Message}"); }
 
-        // Patch Task.Yield() with a controllable flag — only active during end_turn
-        PatchTaskYield();
+        // Task.Yield patch disabled — causes re-entrancy issues.
+        // PatchTaskYield();
 
         // Initialize localization system (needed for events, cards, etc.)
         InitLocManager();
