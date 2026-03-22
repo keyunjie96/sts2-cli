@@ -1905,6 +1905,7 @@ public class RunSimulator
                     ["description"] = _loc.Bilingual("cards", c.Id.Entry + ".description"),
                     ["stats"] = dstats.Count > 0 ? dstats : null,
                     ["keywords"] = dkws?.Count > 0 ? dkws : null,
+                    ["after_upgrade"] = GetUpgradedInfo(c),
                 };
             }).ToList(),
         };

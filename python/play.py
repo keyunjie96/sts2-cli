@@ -346,6 +346,10 @@ def show_player(p, show_deck=False):
                 print(f"    {n(cd['name'])}{up} ({cd.get('cost','?')}) {c(t(cd.get('type',''), ctype_zh), 'dim')}{kw_str}")
                 if cd_d:
                     print(f"      {c(cd_d, 'dim')}")
+                stats = cd.get("stats") or {}
+                aug_parts = _format_upgrade_preview(stats, cd.get("after_upgrade"), cd.get("cost"))
+                if aug_parts:
+                    print(f"      {c(t('upgrade:','升级:'), 'green')} {', '.join(aug_parts)}")
 
 def show_combat(state):
     rnd = state.get("round", 0)
