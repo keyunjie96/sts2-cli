@@ -52,11 +52,11 @@ python3 python/smart_agent.py 100   # 跑 100 局
 
 | 角色 | 状态 |
 |---|---|
-| 铁甲战士 (Ironclad) | ✅ 已测试 |
-| 静默猎手 (Silent) | 🚧 开发中 |
-| 故障机器人 (Defect) | 🚧 充能球未显示 |
-| 亡灵契约师 (Necrobinder) | 🚧 召唤物未显示 |
-| 储君 (Regent) | 🚧 星辰未显示 |
+| 铁甲战士 (Ironclad) | ✅ 完全可玩 |
+| 静默猎手 (Silent) | ✅ 完全可玩 |
+| 故障机器人 (Defect) | ✅ 完全可玩 |
+| 亡灵契约师 (Necrobinder) | ✅ 完全可玩 |
+| 储君 (Regent) | ✅ 完全可玩 |
 
 ## JSON 协议
 

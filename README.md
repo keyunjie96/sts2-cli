@@ -73,11 +73,11 @@ Each command returns a JSON decision point (`map_select` / `combat_play` / `card
 
 | Character | Status |
 |---|---|
-| Ironclad | ✅ Fully tested |
-| Silent | 🚧 In progress |
-| Defect | 🚧 Orbs not displayed yet |
-| Necrobinder | 🚧 Minion (Osty) not displayed yet |
-| Regent | 🚧 Stars not displayed yet |
+| Ironclad | ✅ Fully playable |
+| Silent | ✅ Fully playable |
+| Defect | ✅ Fully playable |
+| Necrobinder | ✅ Fully playable |
+| Regent | ✅ Fully playable |
 
 ## Architecture
 
