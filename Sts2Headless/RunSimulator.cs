@@ -559,7 +559,7 @@ public class RunSimulator
         {
             entry.OnTryPurchaseWrapper(merchantRoom.Inventory).GetAwaiter().GetResult();
             _syncCtx.Pump();
-            Log($"Bought card: {entry.CreationResult.Card.GetType().Name} for {entry.Cost}g");
+            Log($"Bought card: {entry.CreationResult?.Card?.GetType().Name ?? "?"} for {entry.Cost}g");
         }
         catch (Exception ex) { return Error($"Buy card failed: {ex.Message}"); }
 
@@ -613,7 +613,11 @@ public class RunSimulator
             _syncCtx.Pump();
             Log($"Bought potion: {entry.Model.GetType().Name} for {entry.Cost}g");
         }
-        catch (Exception ex) { return Error($"Buy potion failed: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            // Potion purchase sometimes NullRefs in headless (missing potion slot UI)
+            Log($"Buy potion failed: {ex.Message}");
+        }
 
         return DetectDecisionPoint();
     }
@@ -629,7 +633,21 @@ public class RunSimulator
 
         try
         {
-            removal.OnTryPurchaseWrapper(null).GetAwaiter().GetResult();
+            // Run on background thread so card selection can pause (same pattern as event options)
+            var task = Task.Run(() => removal.OnTryPurchaseWrapper(merchantRoom.Inventory));
+            for (int i = 0; i < 100; i++)
+            {
+                _syncCtx.Pump();
+                if (_cardSelector.HasPending) break;
+                if (task.IsCompleted) break;
+                Thread.Sleep(10);
+            }
+            if (_cardSelector.HasPending)
+            {
+                WaitForActionExecutor();
+                return DetectDecisionPoint();
+            }
+            if (!task.IsCompleted) task.Wait(2000);
             _syncCtx.Pump();
             Log($"Removed card for {removal.Cost}g");
         }
