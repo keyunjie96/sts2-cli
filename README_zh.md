@@ -53,9 +53,11 @@ python3 python/smart_agent.py 100   # 跑 100 局
 | 角色 | 状态 |
 |---|---|
 | 铁甲战士 (Ironclad) | ✅ 已测试 |
-| 沉默猎手 (Silent) | 🚧 开发中 |
-| 故障机器人 (Defect) | 🚧 开发中 |
-| 摄政王 (Regent) | 🚧 开发中 |
+| 静默猎手 (Silent) | 🚧 开发中 |
+| 故障机器人 (Defect) | 🚧 充能球未显示 |
+| 亡灵契约师 (Necrobinder) | 🚧 召唤物未显示 |
+| 储君 (Regent) | 🚧 星辰未显示 |
+| 被剥夺者 (Deprived) | ⚙️ 调试角色 |
 
 ## JSON 协议
 
