@@ -945,10 +945,15 @@ public class RunSimulator
             }
 
             // After non-Smith rest site options (HEAL, etc.), the options may not clear.
-            // Force transition to map to prevent infinite rest_site loop.
+            // Wait for the action to complete (heal/dig), then force transition to map.
             if (!_cardSelector.HasPending)
             {
-                Log("Rest site: option chosen (non-Smith), forcing to map");
+                Log("Rest site: option chosen (non-Smith), waiting for action then forcing to map");
+                // Give the action time to complete (heal HP, dig for relic, etc.)
+                WaitForActionExecutor();
+                _syncCtx.Pump();
+                Thread.Sleep(200);
+                _syncCtx.Pump();
                 WaitForActionExecutor();
                 ForceToMap();
                 return MapSelectState();
