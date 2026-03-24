@@ -269,6 +269,195 @@ public class RunSimulator
         }
     }
 
+    // ─── Test/Debug commands ───
+
+    private static readonly System.Reflection.BindingFlags NonPublic =
+        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+
+    /// <summary>Get the backing List&lt;T&gt; behind an IReadOnlyList property via reflection.</summary>
+    private static List<T>? GetBackingList<T>(object obj, string fieldName)
+    {
+        var field = obj.GetType().GetField(fieldName, NonPublic);
+        return field?.GetValue(obj) as List<T>;
+    }
+
+    private static void SetField(object obj, string fieldName, object? value)
+    {
+        var field = obj.GetType().GetField(fieldName, NonPublic);
+        field?.SetValue(obj, value);
+    }
+
+    public Dictionary<string, object?> SetPlayer(Dictionary<string, System.Text.Json.JsonElement> args)
+    {
+        try
+        {
+            if (_runState == null) return Error("No run in progress");
+            var player = _runState.Players[0];
+
+            if (args.TryGetValue("hp", out var hpEl) && player.Creature != null)
+                SetField(player.Creature, "_currentHp", hpEl.GetInt32());
+            if (args.TryGetValue("max_hp", out var mhpEl) && player.Creature != null)
+                SetField(player.Creature, "_maxHp", mhpEl.GetInt32());
+            if (args.TryGetValue("gold", out var goldEl))
+                player.Gold = goldEl.GetInt32();
+
+            if (args.TryGetValue("relics", out var relicsEl))
+            {
+                var list = GetBackingList<RelicModel>(player, "_relics");
+                if (list != null)
+                {
+                    list.Clear();
+                    foreach (var rEl in relicsEl.EnumerateArray())
+                    {
+                        var id = rEl.GetString();
+                        if (id == null) continue;
+                        var model = ModelDb.GetById<RelicModel>(new ModelId("RELIC", id));
+                        if (model != null) list.Add(model);
+                    }
+                }
+            }
+            if (args.TryGetValue("deck", out var deckEl))
+            {
+                var list = GetBackingList<CardModel>(player.Deck, "_cards");
+                if (list != null)
+                {
+                    list.Clear();
+                    foreach (var cEl in deckEl.EnumerateArray())
+                    {
+                        var id = cEl.GetString();
+                        if (id == null) continue;
+                        var model = ModelDb.GetById<CardModel>(new ModelId("CARD", id));
+                        if (model != null) list.Add(model);
+                    }
+                }
+            }
+            if (args.TryGetValue("potions", out var potionsEl))
+            {
+                var slots = GetBackingList<PotionModel>(player, "_potionSlots")
+                         ?? GetBackingList<PotionModel?>(player, "_potionSlots") as System.Collections.IList;
+                if (slots != null)
+                {
+                    for (int i = 0; i < slots.Count; i++) slots[i] = null;
+                    int idx = 0;
+                    foreach (var pEl in potionsEl.EnumerateArray())
+                    {
+                        if (idx >= slots.Count) break;
+                        var id = pEl.GetString();
+                        if (id != null)
+                        {
+                            var model = ModelDb.GetById<PotionModel>(new ModelId("POTION", id));
+                            if (model != null) slots[idx] = model;
+                        }
+                        idx++;
+                    }
+                }
+            }
+
+            Log($"SetPlayer: hp={player.Creature?.CurrentHp} gold={player.Gold} relics={player.Relics.Count} deck={player.Deck?.Cards?.Count}");
+            return new Dictionary<string, object?>
+            {
+                ["type"] = "ok",
+                ["player"] = PlayerSummary(player),
+            };
+        }
+        catch (Exception ex) { return ErrorWithTrace("SetPlayer failed", ex); }
+    }
+
+    public Dictionary<string, object?> EnterRoom(string roomType, string? encounter, string? eventId)
+    {
+        try
+        {
+            if (_runState == null) return Error("No run in progress");
+            var runState = _runState;
+            Log($"EnterRoom: type={roomType} encounter={encounter} event={eventId}");
+
+            AbstractRoom room;
+            switch (roomType.ToLowerInvariant())
+            {
+                case "combat":
+                case "monster":
+                case "elite":
+                {
+                    if (string.IsNullOrEmpty(encounter))
+                        encounter = "SHRINKER_BEETLE_WEAK"; // default encounter
+                    var encModel = ModelDb.GetById<EncounterModel>(new ModelId("ENCOUNTER", encounter));
+                    if (encModel == null) return Error($"Unknown encounter: {encounter}");
+                    room = new CombatRoom(encModel.ToMutable(), runState);
+                    break;
+                }
+                case "shop":
+                    room = new MerchantRoom();
+                    break;
+                case "rest":
+                case "rest_site":
+                    room = new RestSiteRoom();
+                    break;
+                case "event":
+                {
+                    if (string.IsNullOrEmpty(eventId))
+                        return Error("event requires 'event' parameter (e.g. CHANGELING_GROVE)");
+                    var evModel = ModelDb.GetById<EventModel>(new ModelId("EVENT", eventId));
+                    if (evModel == null) return Error($"Unknown event: {eventId}");
+                    room = new EventRoom(evModel);
+                    break;
+                }
+                case "treasure":
+                    room = new TreasureRoom(_runState.CurrentActIndex);
+                    break;
+                default:
+                    return Error($"Unknown room type: {roomType}");
+            }
+
+            RunManager.Instance.EnterRoom(room).GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+            return DetectDecisionPoint();
+        }
+        catch (Exception ex) { return ErrorWithTrace("EnterRoom failed", ex); }
+    }
+
+    public Dictionary<string, object?> SetDrawOrder(List<string> cardIds)
+    {
+        try
+        {
+            if (_runState == null) return Error("No run in progress");
+            var player = _runState.Players[0];
+            var pcs = player.PlayerCombatState;
+            if (pcs?.DrawPile == null) return Error("Not in combat");
+
+            var drawList = GetBackingList<CardModel>(pcs.DrawPile, "_cards");
+            if (drawList == null) return Error("Cannot access draw pile");
+
+            var newOrder = new List<CardModel>();
+            var available = new List<CardModel>(drawList);
+            foreach (var cardId in cardIds)
+            {
+                var match = available.FirstOrDefault(c =>
+                    c.Id.Entry.Equals(cardId, StringComparison.OrdinalIgnoreCase));
+                if (match != null)
+                {
+                    newOrder.Add(match);
+                    available.Remove(match);
+                }
+            }
+            newOrder.AddRange(available);
+
+            drawList.Clear();
+            drawList.AddRange(newOrder);
+
+            Log($"SetDrawOrder: {newOrder.Count} cards, top={newOrder.FirstOrDefault()?.Id.Entry}");
+            return new Dictionary<string, object?>
+            {
+                ["type"] = "ok",
+                ["draw_pile_count"] = drawList.Count,
+                ["top_cards"] = newOrder.Take(5).Select(c => _loc.Card(c.Id.Entry)).ToList(),
+            };
+        }
+        catch (Exception ex) { return ErrorWithTrace("SetDrawOrder failed", ex); }
+    }
+
+    // ─── Game actions ───
+
     public Dictionary<string, object?> ExecuteAction(string action, Dictionary<string, object?>? args)
     {
         try

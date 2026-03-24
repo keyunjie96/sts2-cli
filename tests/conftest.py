@@ -53,6 +53,17 @@ class Game:
     def get_map(self):
         return self.send({"cmd": "get_map"})
 
+    def set_player(self, **kwargs):
+        cmd = {"cmd": "set_player", **kwargs}
+        return self.send(cmd)
+
+    def enter_room(self, room_type, **kwargs):
+        cmd = {"cmd": "enter_room", "type": room_type, **kwargs}
+        return self.send(cmd)
+
+    def set_draw_order(self, cards):
+        return self.send({"cmd": "set_draw_order", "cards": cards})
+
     def close(self):
         try:
             self.proc.stdin.write('{"cmd":"quit"}\n')
@@ -68,7 +79,7 @@ class Game:
     # --- Auto-play helpers ---
 
     def auto_combat(self, state):
-        """Play one card or end turn. Returns next state."""
+        """Play one card or end turn."""
         hand = state.get("hand", [])
         energy = state.get("energy", 0)
         playable = [c for c in hand if c.get("can_play") and c.get("cost", 99) <= energy]
@@ -82,30 +93,23 @@ class Game:
             return self.act("play_card", **args)
         return self.act("end_turn")
 
-    def play_to_decision(self, state, target, max_steps=500):
-        """Auto-play until reaching a specific decision type.
-
-        Returns the state at the target decision.
-        Raises RuntimeError if game_over or max_steps exceeded.
-        """
+    def auto_play_combat(self, state, max_steps=300):
+        """Auto-play combat until it ends."""
         for _ in range(max_steps):
-            dec = state.get("decision", "")
-            if dec == target:
+            if state.get("decision") != "combat_play":
                 return state
-            if dec == "game_over":
-                raise RuntimeError(f"Game ended before reaching '{target}'")
-            if state.get("type") == "error":
-                state = self.act("proceed")
-                continue
+            state = self.auto_combat(state)
+        raise RuntimeError("Combat did not end")
 
+    def skip_neow(self, state):
+        """Skip the Neow event and all follow-up rewards until map_select."""
+        for _ in range(20):
+            dec = state.get("decision", "")
+            if dec == "map_select":
+                return state
             if dec == "event_choice":
-                opts = [o for o in state.get("options", []) if not o.get("is_locked")]
-                state = self.act("choose_option", option_index=opts[0]["index"]) if opts else self.act("leave_room")
-            elif dec == "map_select":
-                ch = state["choices"][0]
-                state = self.act("select_map_node", col=ch["col"], row=ch["row"])
-            elif dec == "combat_play":
-                state = self.auto_combat(state)
+                opts = [o for o in state["options"] if not o.get("is_locked")]
+                state = self.act("choose_option", option_index=opts[0]["index"])
             elif dec == "card_reward":
                 state = self.act("skip_card_reward")
             elif dec == "bundle_select":
@@ -115,59 +119,9 @@ class Game:
                     state = self.act("skip_select")
                 else:
                     state = self.act("select_cards", indices="0")
-            elif dec == "rest_site":
-                opts = [o for o in state.get("options", []) if o.get("is_enabled")]
-                state = self.act("choose_option", option_index=opts[0]["index"])
-            elif dec == "shop":
-                state = self.act("leave_room")
             else:
                 state = self.act("proceed")
-        raise RuntimeError(f"Did not reach '{target}' in {max_steps} steps")
-
-    def play_to_decision_via(self, state, target, prefer_node=None):
-        """Like play_to_decision but prefers a specific map node type."""
-        for _ in range(500):
-            dec = state.get("decision", "")
-            if dec == target:
-                return state
-            if dec == "game_over":
-                raise RuntimeError(f"Game ended before reaching '{target}'")
-            if state.get("type") == "error":
-                state = self.act("proceed")
-                continue
-
-            if dec == "map_select" and prefer_node:
-                choices = state["choices"]
-                pick = next((c for c in choices if c["type"] == prefer_node), choices[0])
-                state = self.act("select_map_node", col=pick["col"], row=pick["row"])
-            elif dec == "map_select":
-                ch = state["choices"][0]
-                state = self.act("select_map_node", col=ch["col"], row=ch["row"])
-            elif dec == "combat_play":
-                state = self.auto_combat(state)
-            elif dec == "event_choice":
-                opts = [o for o in state.get("options", []) if not o.get("is_locked")]
-                state = self.act("choose_option", option_index=opts[0]["index"]) if opts else self.act("leave_room")
-            elif dec == "card_reward":
-                state = self.act("skip_card_reward")
-            elif dec == "bundle_select":
-                state = self.act("select_bundle", bundle_index=0)
-            elif dec == "card_select":
-                if state.get("min_select", 0) == 0:
-                    state = self.act("skip_select")
-                else:
-                    state = self.act("select_cards", indices="0")
-            elif dec == "rest_site":
-                opts = [o for o in state.get("options", []) if o.get("is_enabled")]
-                state = self.act("choose_option", option_index=opts[0]["index"])
-            elif dec == "shop":
-                if target != "shop":
-                    state = self.act("leave_room")
-                else:
-                    return state
-            else:
-                state = self.act("proceed")
-        raise RuntimeError(f"Did not reach '{target}' in 500 steps")
+        return state
 
 
 @pytest.fixture

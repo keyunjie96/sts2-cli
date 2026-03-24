@@ -117,6 +117,31 @@ class Program
             case "get_map":
                 return sim.GetFullMap();
 
+            case "set_player":
+            {
+                var args = new Dictionary<string, JsonElement>();
+                foreach (var prop in cmd.EnumerateObject())
+                    if (prop.Name != "cmd") args[prop.Name] = prop.Value;
+                return sim.SetPlayer(args);
+            }
+
+            case "enter_room":
+            {
+                var roomType = cmd.TryGetProperty("type", out var rt) ? rt.GetString() ?? "" : "";
+                var encounter = cmd.TryGetProperty("encounter", out var enc) ? enc.GetString() : null;
+                var eventId = cmd.TryGetProperty("event", out var ev) ? ev.GetString() : null;
+                return sim.EnterRoom(roomType, encounter, eventId);
+            }
+
+            case "set_draw_order":
+            {
+                var cards = new List<string>();
+                if (cmd.TryGetProperty("cards", out var cardsArr))
+                    foreach (var c in cardsArr.EnumerateArray())
+                        cards.Add(c.GetString() ?? "");
+                return sim.SetDrawOrder(cards);
+            }
+
             case "quit":
                 sim.CleanUp();
                 return null;
