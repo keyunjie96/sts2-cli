@@ -119,19 +119,20 @@ class TestCombatEnd:
         state = game.auto_play_combat(state)
         assert state["decision"] in ("card_reward", "map_select", "card_select", "bundle_select")
 
-    def test_enemy_powers_have_description(self, game):
+    def test_player_powers_after_enemy_debuff(self, game):
+        """Shrinker Beetle applies Shrink debuff to player after its turn."""
         state = game.start(seed="ep1")
         game.skip_neow(state)
         state = game.enter_room("combat", encounter="SHRINKER_BEETLE_WEAK")
-        # Play a round so beetle applies Shrink
+        # End turn so beetle acts (applies Shrink to player)
         state = game.act("end_turn")
         if state["decision"] == "combat_play":
-            for e in state.get("enemies", []):
-                for pw in (e.get("powers") or []):
-                    assert "name" in pw
-                    assert "description" in pw
-                    return
-        pytest.skip("No enemy powers found")
+            pp = state.get("player_powers") or []
+            assert len(pp) > 0, "Expected player debuff after Shrinker Beetle turn"
+            for pw in pp:
+                assert "name" in pw
+                assert "amount" in pw
+                assert "description" in pw
 
 
 class TestCombatEdgeCases:

@@ -83,7 +83,6 @@ class TestShopBuy:
 
 
 class TestShopRemove:
-    @pytest.mark.xfail(reason="Known bug: shop state not updated after card removal")
     def test_remove_card_flow(self, game):
         state = game.start(seed="sr1")
         game.skip_neow(state)

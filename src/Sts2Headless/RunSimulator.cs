@@ -1010,6 +1010,15 @@ public class RunSimulator
             return MapSelectState();
         }
 
+        // Extra wait for shop card removal: the purchase task needs to finish
+        if (_runState?.CurrentRoom is MerchantRoom)
+        {
+            Thread.Sleep(200);
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+            Log("Card selection in shop (card removal), refreshing shop state");
+        }
+
         return DetectDecisionPoint();
     }
 
