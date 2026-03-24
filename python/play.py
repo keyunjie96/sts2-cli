@@ -517,18 +517,9 @@ def show_map(state, send_fn=None):
     if send_fn:
         map_data = send_fn({"cmd": "get_map"})
         if map_data and map_data.get("type") == "map":
-            _render_map(map_data, choice_set)
-            # Print available choices below the map
-            type_icons = {
-                "Monster": "⚔", "Elite": "💀", "Boss": "👹",
-                "RestSite": "🏕", "Shop": "🏪", "Treasure": "💎",
-                "Event": "❓", "Unknown": "❓", "Ancient": "🏛",
-            }
-            print(f"  {c(t('Available paths:','可选路径:'), 'bold')}")
-            for i, ch in enumerate(choices):
-                icon = type_icons.get(ch["type"], "?")
-                ntype = t(ch["type"], NODE_TYPE_ZH.get(ch["type"], ch["type"]))
-                print(f"    [{i}] {c(icon, 'yellow')} {ntype}  ({t('col','列')}{ch['col']}, {t('row','行')}{ch['row']})")
+            # Build index map: (col,row) → choice index
+            choice_indices = {(ch["col"], ch["row"]): i for i, ch in enumerate(choices)}
+            _render_map(map_data, choice_set, choice_indices)
             return
 
     # Fallback: simple list
@@ -746,10 +737,12 @@ def show_event(state):
 
 # ─── Input handling ───
 
-def _render_map(map_data, choice_set=None):
+def _render_map(map_data, choice_set=None, choice_indices=None):
     """Render map as a grid with connection lines between rows."""
     if choice_set is None:
         choice_set = set()
+    if choice_indices is None:
+        choice_indices = {}
 
     ctx = map_data.get("context", {})
     act = n(ctx.get("act_name", "?"))
@@ -838,14 +831,16 @@ def _render_map(map_data, choice_set=None):
             visited = nd.get("visited", False)
 
             center = col * W + W // 2
+            choice_idx = choice_indices.get((col, rn))
             if is_cur:
                 buf[center - 1] = "["
                 buf[center] = icon
                 buf[center + 1] = "]"
                 color_subs.append((center - 1, center + 2, c(f"[{icon}]", "green")))
-            elif is_choice:
-                buf[center] = icon
-                color_subs.append((center, center + 1, c(icon, "yellow")))
+            elif choice_idx is not None:
+                label = str(choice_idx)
+                buf[center] = label
+                color_subs.append((center, center + 1, c(label, "yellow")))
             elif visited:
                 buf[center] = icon
                 color_subs.append((center, center + 1, c(icon, "dim")))
@@ -878,8 +873,21 @@ def _render_map(map_data, choice_set=None):
 
     # Legend
     print(f"  {'─' * width}")
-    legend = f"  {c('M','red')}={t('Monster','怪')} {c('E','red')}={t('Elite','英')} R={t('Rest','休')} $={t('Shop','店')} T={t('Treasure','宝')} ?={t('Event','事')} {c('[x]','green')}={t('You','你')} {c('x','yellow')}={t('Next','可选')}"
+    legend = (f"  M={t('Monster','怪物')} E={t('Elite','精英')} R={t('Rest','休息')} "
+              f"$={t('Shop','商店')} T={t('Treasure','宝箱')} ?={t('Event','事件')} "
+              f"{c('[x]','green')}={t('You','当前')} {c('0','yellow')}={t('Choice','可选')}")
     print(legend)
+    # Show choice details
+    if choice_indices:
+        inv = {v: k for k, v in choice_indices.items()}
+        parts = []
+        for i in sorted(inv.keys()):
+            col, row = inv[i]
+            nd = node_map.get((col, row))
+            if nd:
+                ntype = t(nd.get("type", "?"), NODE_TYPE_ZH.get(nd.get("type", ""), nd.get("type", "?")))
+                parts.append(f"{c(str(i), 'yellow')}={ntype}")
+        print(f"  {' '.join(parts)}")
     print()
 
 
@@ -1199,6 +1207,9 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0):
                 if min_sel == 0:
                     valid["s"] = None
 
+                # Save state before selection to show diff
+                old_deck_cards = [n(cd.get("name","?")) for cd in state.get("player",{}).get("deck",[])]
+
                 if auto:
                     choice = "0"
                 else:
@@ -1210,6 +1221,20 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0):
                     # Support comma-separated indices
                     state = send({"cmd": "action", "action": "select_cards",
                                  "args": {"indices": choice}})
+
+                # Show what changed
+                if state and state.get("player"):
+                    from collections import Counter
+                    new_deck_cards = [n(cd.get("name","?")) for cd in state["player"].get("deck",[])]
+                    added = Counter(new_deck_cards) - Counter(old_deck_cards)
+                    removed = Counter(old_deck_cards) - Counter(new_deck_cards)
+                    if added or removed:
+                        parts = []
+                        for card_name, cnt in removed.items():
+                            parts.append(c(f"-{card_name}" + (f"x{cnt}" if cnt > 1 else ""), "red"))
+                        for card_name, cnt in added.items():
+                            parts.append(c(f"+{card_name}" + (f"x{cnt}" if cnt > 1 else ""), "green"))
+                        print(f"\n  {c(t('Changes:','变化:'), 'yellow')} {t('Deck','牌组')}: {' '.join(parts)}")
 
             elif dec == "shop":
                 show_shop(state)
@@ -1347,7 +1372,7 @@ if __name__ == "__main__":
                        help="Ascension level (0-10)")
     parser.add_argument("--lang", type=str, default="zh",
                        choices=["en", "zh"],
-                       help="Display language: en, zh, or both")
+                       help="Display language: en or zh (default: zh)")
     args = parser.parse_args()
 
     LANG = args.lang
