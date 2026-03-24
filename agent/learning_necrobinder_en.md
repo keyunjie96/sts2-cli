@@ -46,15 +46,12 @@ Block only (p=10), Enfeebling (p=12), powers deprioritized (p=200)
 - **Prioritize getting Calcify early, upgrade first**
 
 ## Dangerous Enemies
-- **Byrdonis**: Str scales 17-36-54-90, kill in 4-5 turns
-- **Bygone Effigy** (127hp): sleeps 1-2 turns then 23 dmg/turn, NEVER fight < 60 HP
-- **Phrog Parasite**: 4 Wrigglers on death, Infection cards = real threat, AoE critical
-- **Mawler** (72hp): 6+ turn fight, save Osty for big Unleash
-- **Tracker Raider**: can deal 64 dmg in one turn
-- **Shrinker Beetle** (39hp): Shrink reduces all attacks by ~2-4 dmg, long fight
-- **Shrinker Beetle + Fuzzy Wurm**: kill Beetle first
-- **Strangler** (53hp): very tanky, debuffs + 12 dmg/turn
-- **Fogmog** (74hp): Eye has Illusion (first attack does 1 dmg); can't target Fogmog when Eye alive; Eye respawns; 10+ round fight drains 30+ HP
+- **Byrdonis**: Str 17→36→54→90, kill in 4-5 turns or die
+- **Bygone Effigy** (127hp): 23 dmg/turn after sleep, NEVER fight < 60 HP
+- **Phrog Parasite**: spawns 4 Wrigglers + Infection cards on death, AoE critical
+- **Mawler** (72hp): 6+ turn sustained fight, save Osty for big Unleash
+- **Shrinker Beetle** (+Fuzzy Wurm): kill Beetle first; Shrink reduces all attacks
+- **Fogmog** (74hp): Eye respawns w/ Illusion; 10+ round fight drains 30+ HP
 
 ## Multi-Enemy Crisis (#1 cause of death)
 - Slime+Flyconid: 40-60 HP loss. 4-slime: 50+ HP. Raiders: 30-60 HP.
@@ -96,3 +93,8 @@ Block only (p=10), Enfeebling (p=12), powers deprioritized (p=200)
 - Poke scales with Osty HP — free 6+ dmg when Osty healthy
 - Drain Power = strongest single-target (10 dmg + draw 2)
 - Devour Life: Power Potion can offer this — heals on attack, excellent for boss
+- **Eradicate is MULTI-HIT** — "Deal 11 dmg X times" where X = current energy. 3e = 33 dmg (3 hits). AMAZING vs Slippery bosses (strips 1 layer per hit)
+- **Eradicate scales with energy** — Wisp (+1e), Tea Set relic (+2e turn 1) are Eradicate amplifiers. 5e = 55 dmg
+- **Melancholy cost reduction** — Reduces by 1 each time ANYTHING dies (enemies, Osty, minions). Often free in multi-enemy fights
+- **Haunt triggers on Soul play** — NOT end of turn. Need frequent Soul generation (Grave Warden, Reave produce Souls) for Haunt to deal damage
+- **Vantom Boss (173hp, Slippery 9)** — Enter with 55+ HP. Eradicate is best damage card (multi-hit strips Slippery). Play Calcify + Haunt turn 1, then Eradicate nuke turns
