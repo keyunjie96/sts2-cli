@@ -462,6 +462,9 @@ public class RunSimulator
                     return Error($"Unknown room type: {roomType}");
             }
 
+            // Wait for any pending relic session before entering a new room
+            WaitForRelicPickingComplete();
+
             RunManager.Instance.EnterRoom(room).GetAwaiter().GetResult();
             _syncCtx.Pump();
             WaitForActionExecutor();
@@ -596,9 +599,37 @@ public class RunSimulator
 
         // Call EnterMapCoord directly (same as what MoveToMapCoordAction does in TestMode)
         // This avoids the action executor which can swallow errors silently.
-        RunManager.Instance.EnterMapCoord(coord).GetAwaiter().GetResult();
-        _syncCtx.Pump();
-        WaitForActionExecutor();
+        // Retry once if relic picking race condition occurs; on persistent failure, return error.
+        bool enterSucceeded = false;
+        try
+        {
+            RunManager.Instance.EnterMapCoord(coord).GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+            enterSucceeded = true;
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains("relic picking session"))
+        {
+            Log($"EnterMapCoord relic session conflict: {ex.Message} — retrying after pump");
+            // Pump aggressively then retry once
+            ForceResetRelicPickingState();
+            try
+            {
+                RunManager.Instance.EnterMapCoord(coord).GetAwaiter().GetResult();
+                _syncCtx.Pump();
+                WaitForActionExecutor();
+                enterSucceeded = true;
+            }
+            catch (Exception retryEx)
+            {
+                Log($"EnterMapCoord retry also failed: {retryEx.GetType().Name}: {retryEx.Message}");
+                // Don't crash — return error so the caller can try a different action
+                return ErrorWithTrace("EnterMapCoord failed (relic session conflict)", retryEx);
+            }
+        }
+
+        if (!enterSucceeded)
+            return Error("EnterMapCoord failed");
 
         return DetectDecisionPoint();
     }
@@ -1398,6 +1429,9 @@ public class RunSimulator
     private Dictionary<string, object?> DoProceed(Player player)
     {
         Log("Proceeding");
+
+        // Wait for any pending relic session before proceeding
+        WaitForRelicPickingComplete();
 
         // Check if we need to move to next act (boss defeated)
         var room = _runState?.CurrentRoom;
@@ -2587,101 +2621,36 @@ public class RunSimulator
         }
     }
 
+    // NOTE: The _isInSharedRelicPicking flag lives on MegaCrit.Sts2.Core.Entities.TreasureRelicPicking,
+    // a per-instance entity that cannot be accessed via RunManager reflection.
+    // Protection against the relic picking race condition relies on:
+    // 1. WaitForRelicPickingComplete() — aggressively pumps the sync context
+    // 2. DoMapSelect retry loop — catches InvalidOperationException and retries
+    // 3. DetectDecisionPoint wrapper — catches exceptions from TreasureState and recovers to map
+
+
     /// <summary>
-    /// Wait for any active relic picking session to complete before starting a new one.
-    /// Uses reflection to check the _isInSharedRelicPicking flag on RunManager or its
-    /// TreasureRoomRelicSynchronizer. This prevents the
-    /// "Attempted to start new relic picking session while one was already occurring!"
-    /// InvalidOperationException that crashes treasure rooms.
+    /// Wait for any pending async work to complete before entering a new room.
+    /// The _isInSharedRelicPicking flag lives on a per-instance TreasureRelicPicking entity
+    /// that cannot be accessed via reflection from RunManager. Instead of trying to introspect
+    /// the flag, we aggressively pump the sync context and wait for the action executor to idle.
+    /// The primary defense against relic picking race conditions is the catch-and-retry loop
+    /// in DoMapSelect and the defensive wrapper in DetectDecisionPoint.
     /// </summary>
-    private void WaitForRelicPickingComplete(int timeoutMs = 8000)
+    private void WaitForRelicPickingComplete(int timeoutMs = 2000)
     {
         try
         {
-            // Try to find the _isInSharedRelicPicking field via reflection
-            var runMgr = RunManager.Instance;
-            FieldInfo? pickingField = null;
-            object? fieldOwner = null;
-
-            // Check RunManager itself
-            pickingField = runMgr.GetType().GetField("_isInSharedRelicPicking",
-                BindingFlags.NonPublic | BindingFlags.Instance);
-            if (pickingField != null)
-            {
-                fieldOwner = runMgr;
-            }
-            else
-            {
-                // Check TreasureRoomRelicSynchronizer property
-                var syncProp = runMgr.GetType().GetProperty("TreasureRoomRelicSynchronizer",
-                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                var synchronizer = syncProp?.GetValue(runMgr);
-                if (synchronizer != null)
-                {
-                    pickingField = synchronizer.GetType().GetField("_isInSharedRelicPicking",
-                        BindingFlags.NonPublic | BindingFlags.Instance);
-                    if (pickingField != null) fieldOwner = synchronizer;
-                }
-            }
-
-            // Also look for _relicPickingTaskCompletionSource to check if a task is pending
-            FieldInfo? tcsField = null;
-            object? tcsOwner = null;
-            tcsField = runMgr.GetType().GetField("_relicPickingTaskCompletionSource",
-                BindingFlags.NonPublic | BindingFlags.Instance);
-            if (tcsField != null) tcsOwner = runMgr;
-
-            if (pickingField == null && tcsField == null)
-            {
-                // Can't introspect — fall back to just pumping
-                WaitForActionExecutor(timeoutMs);
-                return;
-            }
-
+            // Pump aggressively to drain any pending async continuations
             var timer = Stopwatch.StartNew();
-            while (timer.ElapsedMilliseconds < timeoutMs)
+            for (int i = 0; i < 200 && timer.ElapsedMilliseconds < timeoutMs; i++)
             {
                 _syncCtx.Pump();
-
-                bool isPicking = false;
-
-                // Check the boolean flag
-                if (pickingField != null && fieldOwner != null)
-                {
-                    try { isPicking = (bool)(pickingField.GetValue(fieldOwner) ?? false); }
-                    catch { }
-                }
-
-                // Also check if TCS is non-null and not completed
-                if (!isPicking && tcsField != null && tcsOwner != null)
-                {
-                    try
-                    {
-                        var tcs = tcsField.GetValue(tcsOwner);
-                        if (tcs != null)
-                        {
-                            // TaskCompletionSource<T>.Task.IsCompleted
-                            var taskProp = tcs.GetType().GetProperty("Task");
-                            var task = taskProp?.GetValue(tcs) as Task;
-                            if (task != null && !task.IsCompleted)
-                                isPicking = true;
-                        }
-                    }
-                    catch { }
-                }
-
-                if (!isPicking)
-                {
-                    // Relic picking is done (or was never active)
-                    return;
-                }
-
-                // Still picking — pump and wait
-                WaitForActionExecutor(500);
+                var executor = RunManager.Instance.ActionExecutor;
+                if (!executor.IsRunning) break;
                 Thread.Sleep(10);
             }
-
-            Log($"WaitForRelicPickingComplete timed out after {timer.ElapsedMilliseconds}ms — proceeding anyway");
+            _syncCtx.Pump();
         }
         catch (Exception ex)
         {
@@ -2690,60 +2659,24 @@ public class RunSimulator
     }
 
     /// <summary>
-    /// Force-clear the _isInSharedRelicPicking flag via reflection when the relic picking
-    /// session is stuck. This is a last resort to prevent cascading failures where a stale
-    /// flag blocks all subsequent treasure rooms. Also completes any pending TCS.
+    /// Aggressively pump the sync context to try to drain pending relic picking async work.
+    /// Since the _isInSharedRelicPicking flag is on a per-instance entity (TreasureRelicPicking)
+    /// and not accessible via reflection, this is best-effort. The real protection is the
+    /// catch-and-retry loop in DoMapSelect.
     /// </summary>
     private void ForceResetRelicPickingState()
     {
         try
         {
-            var runMgr = RunManager.Instance;
-
-            // Try RunManager._isInSharedRelicPicking
-            var pickingField = runMgr.GetType().GetField("_isInSharedRelicPicking",
-                BindingFlags.NonPublic | BindingFlags.Instance);
-            if (pickingField != null)
+            // Pump aggressively with longer delay to let async work complete
+            for (int i = 0; i < 50; i++)
             {
-                pickingField.SetValue(runMgr, false);
-                Log("ForceResetRelicPickingState: cleared _isInSharedRelicPicking on RunManager");
+                _syncCtx.Pump();
+                if (!RunManager.Instance.ActionExecutor.IsRunning) break;
+                Thread.Sleep(20);
             }
-            else
-            {
-                // Try TreasureRoomRelicSynchronizer._isInSharedRelicPicking
-                var syncProp = runMgr.GetType().GetProperty("TreasureRoomRelicSynchronizer",
-                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                var synchronizer = syncProp?.GetValue(runMgr);
-                if (synchronizer != null)
-                {
-                    pickingField = synchronizer.GetType().GetField("_isInSharedRelicPicking",
-                        BindingFlags.NonPublic | BindingFlags.Instance);
-                    if (pickingField != null)
-                    {
-                        pickingField.SetValue(synchronizer, false);
-                        Log("ForceResetRelicPickingState: cleared _isInSharedRelicPicking on TreasureRoomRelicSynchronizer");
-                    }
-                }
-            }
-
-            // Also try to cancel/complete any pending _relicPickingTaskCompletionSource
-            var tcsField = runMgr.GetType().GetField("_relicPickingTaskCompletionSource",
-                BindingFlags.NonPublic | BindingFlags.Instance);
-            if (tcsField != null)
-            {
-                var tcs = tcsField.GetValue(runMgr);
-                if (tcs != null)
-                {
-                    // Try to cancel it so waiting code unblocks
-                    var trySetCanceledMethod = tcs.GetType().GetMethod("TrySetCanceled", Type.EmptyTypes);
-                    trySetCanceledMethod?.Invoke(tcs, null);
-                    // Clear the field itself
-                    tcsField.SetValue(runMgr, null);
-                    Log("ForceResetRelicPickingState: cleared _relicPickingTaskCompletionSource");
-                }
-            }
-
             _syncCtx.Pump();
+            Log("ForceResetRelicPickingState: pumped sync context");
         }
         catch (Exception ex)
         {
