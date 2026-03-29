@@ -207,6 +207,9 @@ public class RunSimulator
     private IReadOnlyList<IReadOnlyList<CardModel>>? _pendingBundles;
     private TaskCompletionSource<IEnumerable<CardModel>>? _pendingBundleTcs;
 
+    // Track whether a card has already been removed during this shop visit (only one removal per visit)
+    private bool _shopCardRemoved;
+
     public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null, string lang = "en")
     {
         try
@@ -374,6 +377,7 @@ public class RunSimulator
             if (_runState == null) return Error("No run in progress");
             var runState = _runState;
             Log($"EnterRoom: type={roomType} encounter={encounter} event={eventId}");
+            _shopCardRemoved = false;
 
             AbstractRoom room;
             switch (roomType.ToLowerInvariant())
@@ -531,6 +535,7 @@ public class RunSimulator
         _lastEventOptionCount = 0;
         _pendingRewards = null;
         _lastKnownHp = player.Creature?.CurrentHp ?? 0;
+        _shopCardRemoved = false;
 
         var col = Convert.ToInt32(args["col"]);
         var row = Convert.ToInt32(args["row"]);
@@ -934,6 +939,7 @@ public class RunSimulator
         var removal = merchantRoom.Inventory.CardRemovalEntry;
         if (removal == null) return Error("No card removal available");
         if (player.Gold < removal.Cost) return Error("Not enough gold");
+        if (_shopCardRemoved) return Error("Already removed a card this shop visit");
 
         try
         {
@@ -954,6 +960,7 @@ public class RunSimulator
             if (!task.IsCompleted) task.Wait(2000);
             _syncCtx.Pump();
             Log($"Removed card for {removal.Cost}g");
+            _shopCardRemoved = true;
         }
         catch (Exception ex) { return Error($"Remove card failed: {ex.Message}"); }
 
@@ -1021,6 +1028,7 @@ public class RunSimulator
             _syncCtx.Pump();
             WaitForActionExecutor();
             Log("Card selection in shop (card removal), refreshing shop state");
+            _shopCardRemoved = true;
         }
 
         return DetectDecisionPoint();
@@ -2144,6 +2152,7 @@ public class RunSimulator
             ["relics"] = relics,
             ["potions"] = potions,
             ["card_removal_cost"] = removal?.Cost,
+            ["card_removal_available"] = removal != null && !_shopCardRemoved,
             ["player"] = PlayerSummary(player),
         };
     }
