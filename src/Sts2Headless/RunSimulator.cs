@@ -1890,6 +1890,44 @@ public class RunSimulator
             ["amount"] = pw.Amount,
         }).ToList();
 
+        // Compute per-card effective damage against each enemy
+        try
+        {
+            var playerPowerList = player.Creature?.Powers?.ToList();
+            int playerStrength = playerPowerList?.FirstOrDefault(p => p.Id.Entry == "STRENGTH")?.Amount ?? 0;
+            bool playerWeak = playerPowerList?.Any(p => p.Id.Entry == "WEAK" && p.Amount > 0) ?? false;
+            var enemyCreatures = combatState?.Enemies?.ToList()?.Where(e => e != null && e.IsAlive).ToList();
+
+            if (enemyCreatures != null)
+            {
+                var handCards = pcs?.Hand?.Cards?.ToList();
+                for (int hi = 0; hi < hand.Count && handCards != null && hi < handCards.Count; hi++)
+                {
+                    var c = handCards[hi];
+                    var cardInfo = hand[hi];
+                    // Only compute for attack cards with damage stat
+                    if (c.Type == CardType.Attack && c.DynamicVars.Values.ToList().Any(dv => dv.Name.Equals("Damage", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        int baseDmg = (int)c.DynamicVars.Damage.BaseValue;
+                        var effectiveDamages = enemyCreatures.Select(enemy =>
+                        {
+                            var enemyPowers = enemy.Powers?.ToList();
+                            bool enemyVulnerable = enemyPowers?.Any(p => p.Id.Entry == "VULNERABLE" && p.Amount > 0) ?? false;
+                            double dmg = baseDmg + playerStrength;
+                            if (playerWeak) dmg *= 0.75;
+                            if (enemyVulnerable) dmg *= 1.5;
+                            return (int)Math.Floor(dmg);
+                        }).ToList();
+                        cardInfo["effective_damage"] = effectiveDamages;
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"Effective damage calc: {ex.Message}");
+        }
+
         var result = new Dictionary<string, object?>
         {
             ["type"] = "decision",
@@ -1904,7 +1942,50 @@ public class RunSimulator
             ["player_powers"] = playerPowers?.Count > 0 ? playerPowers : null,
             ["draw_pile_count"] = pcs?.DrawPile?.Cards?.Count ?? 0,
             ["discard_pile_count"] = pcs?.DiscardPile?.Cards?.Count ?? 0,
+            ["exhaust_pile_count"] = pcs?.ExhaustPile?.Cards?.Count ?? 0,
         };
+
+        // Pile contents (wrapped in try/catch — game state access can throw)
+        try
+        {
+            // Draw pile: send card IDs but NOT the order (showing draw order would be cheating)
+            var drawCards = pcs?.DrawPile?.Cards?.ToList();
+            if (drawCards != null)
+            {
+                var shuffled = drawCards.OrderBy(_ => Guid.NewGuid()).ToList();
+                result["draw_pile"] = shuffled.Select(c => new Dictionary<string, object?>
+                {
+                    ["id"] = c.Id.Entry,
+                    ["name"] = _loc.Card(c.Id.Entry),
+                }).ToList();
+            }
+
+            // Discard pile contents
+            var discardCards = pcs?.DiscardPile?.Cards?.ToList();
+            if (discardCards != null)
+            {
+                result["discard_pile"] = discardCards.Select(c => new Dictionary<string, object?>
+                {
+                    ["id"] = c.Id.Entry,
+                    ["name"] = _loc.Card(c.Id.Entry),
+                }).ToList();
+            }
+
+            // Exhaust pile contents
+            var exhaustCards = pcs?.ExhaustPile?.Cards?.ToList();
+            if (exhaustCards != null)
+            {
+                result["exhaust_pile"] = exhaustCards.Select(c => new Dictionary<string, object?>
+                {
+                    ["id"] = c.Id.Entry,
+                    ["name"] = _loc.Card(c.Id.Entry),
+                }).ToList();
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"Pile contents data: {ex.Message}");
+        }
 
         // Character-specific mechanics
         try
@@ -2751,10 +2832,15 @@ public class RunSimulator
             {
                 var vars = new Dictionary<string, object?>();
                 try { foreach (var dv in r.DynamicVars.Values.ToList()) vars[dv.Name] = (int)dv.BaseValue; } catch { }
+                // Derive counter: use the first DynamicVar value if any, else -1 (no counter)
+                int counter = -1;
+                try { if (vars.Count > 0) counter = (int)(vars.Values.First() ?? -1); } catch { }
                 return new Dictionary<string, object?>
                 {
+                    ["id"] = r.Id.Entry,
                     ["name"] = _loc.Relic(r.Id.Entry),
                     ["description"] = _loc.Bilingual("relics", r.Id.Entry + ".description"),
+                    ["counter"] = counter,
                     ["vars"] = vars.Count > 0 ? vars : null,
                 };
             }).ToList(),
