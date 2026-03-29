@@ -25,6 +25,7 @@ using MegaCrit.Sts2.Core.Runs;
 using MegaCrit.Sts2.Core.TestSupport;
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Localization;
+using MegaCrit.Sts2.Core.Localization.DynamicVars;
 using MegaCrit.Sts2.Core.Multiplayer.Serialization;
 using MegaCrit.Sts2.Core.Saves;
 using MegaCrit.Sts2.Core.Unlocks;
@@ -255,6 +256,9 @@ public class RunSimulator
 
     // Track whether a card has already been removed during this shop visit (only one removal per visit)
     private bool _shopCardRemoved;
+
+    /// <summary>God mode: restore player HP to max after every action. For testing.</summary>
+    public bool GodMode { get; set; }
 
     public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null, string lang = "en")
     {
@@ -523,6 +527,20 @@ public class RunSimulator
                 return Error("No run in progress");
 
             var player = _runState.Players[0];
+
+            // God mode: restore HP to max before every action
+            if (GodMode && player.Creature != null)
+            {
+                try
+                {
+                    var maxHp = player.Creature.MaxHp;
+                    if (player.Creature.CurrentHp < maxHp)
+                    {
+                        SetField(player.Creature, "_currentHp", maxHp);
+                    }
+                }
+                catch { }
+            }
 
             switch (action)
             {

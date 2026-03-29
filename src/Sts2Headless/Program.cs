@@ -209,6 +209,7 @@ class Program
         switch (cmdType)
         {
             case "start_run":
+                sim.GodMode = cmd.TryGetProperty("god_mode", out var gm) && gm.GetBoolean();
                 return sim.StartRun(
                     cmd.TryGetProperty("character", out var ch) ? ch.GetString() ?? "Ironclad" : "Ironclad",
                     cmd.TryGetProperty("ascension", out var asc) ? asc.GetInt32() : 0,
