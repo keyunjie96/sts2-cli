@@ -2125,6 +2125,25 @@ public class RunSimulator
                 ["stats"] = stats.Count > 0 ? stats : null,
                 ["after_upgrade"] = GetUpgradedInfo(c),
             };
+            // Include star cost for Regent cards
+            try { if (c.BaseStarCost > 0) cardInfo["star_cost"] = c.BaseStarCost; } catch { }
+            // Include keywords
+            try {
+                var kws = c.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToList();
+                if (kws?.Count > 0) cardInfo["keywords"] = kws;
+            } catch { }
+            // Include enchantment/affliction
+            try {
+                if (c.Enchantment != null) {
+                    cardInfo["enchantment"] = _loc.Bilingual("enchantments", c.Enchantment.Id.Entry + ".title");
+                    if (c.Enchantment.Amount != 0) cardInfo["enchantment_amount"] = c.Enchantment.Amount;
+                }
+                if (c.Affliction != null) {
+                    cardInfo["affliction"] = _loc.Bilingual("afflictions", c.Affliction.Id.Entry + ".title");
+                    if (c.Affliction.Amount != 0) cardInfo["affliction_amount"] = c.Affliction.Amount;
+                }
+            } catch { }
+            return cardInfo;
         }).ToList();
 
         return new Dictionary<string, object?>
