@@ -1606,7 +1606,24 @@ public class RunSimulator
         // Treasure room
         if (room is TreasureRoom treasureRoom)
         {
-            return TreasureState(treasureRoom);
+            try
+            {
+                return TreasureState(treasureRoom);
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("relic picking session"))
+            {
+                // BUG-013: Relic session conflict escaped TreasureState retry loop
+                Log($"Relic session conflict escaped to DetectDecisionPoint: {ex.Message}");
+                ForceResetRelicPickingState();
+                ForceToMap();
+                return MapSelectState();
+            }
+            catch (Exception ex)
+            {
+                Log($"TreasureState failed, recovering to map: {ex.GetType().Name}: {ex.Message}");
+                ForceToMap();
+                return MapSelectState();
+            }
         }
 
         // Fallback
@@ -2669,6 +2686,68 @@ public class RunSimulator
         catch (Exception ex)
         {
             Log($"WaitForRelicPickingComplete exception: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Force-clear the _isInSharedRelicPicking flag via reflection when the relic picking
+    /// session is stuck. This is a last resort to prevent cascading failures where a stale
+    /// flag blocks all subsequent treasure rooms. Also completes any pending TCS.
+    /// </summary>
+    private void ForceResetRelicPickingState()
+    {
+        try
+        {
+            var runMgr = RunManager.Instance;
+
+            // Try RunManager._isInSharedRelicPicking
+            var pickingField = runMgr.GetType().GetField("_isInSharedRelicPicking",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            if (pickingField != null)
+            {
+                pickingField.SetValue(runMgr, false);
+                Log("ForceResetRelicPickingState: cleared _isInSharedRelicPicking on RunManager");
+            }
+            else
+            {
+                // Try TreasureRoomRelicSynchronizer._isInSharedRelicPicking
+                var syncProp = runMgr.GetType().GetProperty("TreasureRoomRelicSynchronizer",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var synchronizer = syncProp?.GetValue(runMgr);
+                if (synchronizer != null)
+                {
+                    pickingField = synchronizer.GetType().GetField("_isInSharedRelicPicking",
+                        BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (pickingField != null)
+                    {
+                        pickingField.SetValue(synchronizer, false);
+                        Log("ForceResetRelicPickingState: cleared _isInSharedRelicPicking on TreasureRoomRelicSynchronizer");
+                    }
+                }
+            }
+
+            // Also try to cancel/complete any pending _relicPickingTaskCompletionSource
+            var tcsField = runMgr.GetType().GetField("_relicPickingTaskCompletionSource",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            if (tcsField != null)
+            {
+                var tcs = tcsField.GetValue(runMgr);
+                if (tcs != null)
+                {
+                    // Try to cancel it so waiting code unblocks
+                    var trySetCanceledMethod = tcs.GetType().GetMethod("TrySetCanceled", Type.EmptyTypes);
+                    trySetCanceledMethod?.Invoke(tcs, null);
+                    // Clear the field itself
+                    tcsField.SetValue(runMgr, null);
+                    Log("ForceResetRelicPickingState: cleared _relicPickingTaskCompletionSource");
+                }
+            }
+
+            _syncCtx.Pump();
+        }
+        catch (Exception ex)
+        {
+            Log($"ForceResetRelicPickingState exception: {ex.Message}");
         }
     }
 
