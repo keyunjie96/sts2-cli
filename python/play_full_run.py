@@ -215,16 +215,35 @@ def play_run(seed: str, character: str = "Ironclad", verbose: bool = True, log: 
                     state = send({"cmd": "action", "action": "leave_room"})
 
             elif decision == "card_reward":
-                # Pick the first card offered
-                cards = state.get("cards", [])
-                if cards:
-                    state = send({
-                        "cmd": "action",
-                        "action": "select_card_reward",
-                        "args": {"card_index": 0}
-                    })
-                else:
-                    state = send({"cmd": "action", "action": "skip_card_reward"})
+                # Collect potion rewards first (if any and space available)
+                potion_rewards = state.get("potion_rewards") or []
+                slots_full = state.get("potion_slots_full", False)
+                for pr in potion_rewards:
+                    if not slots_full:
+                        state = send({"cmd": "action", "action": "collect_potion_reward",
+                                     "args": {"potion_index": pr["index"]}})
+                        potion_rewards = state.get("potion_rewards") or []
+                        slots_full = state.get("potion_slots_full", False)
+                        if state.get("decision") != "card_reward":
+                            break
+                    else:
+                        state = send({"cmd": "action", "action": "skip_potion_reward",
+                                     "args": {"potion_index": pr["index"]}})
+                        potion_rewards = state.get("potion_rewards") or []
+                        if state.get("decision") != "card_reward":
+                            break
+
+                if state.get("decision") == "card_reward":
+                    # Pick the first card offered
+                    cards = state.get("cards", [])
+                    if cards:
+                        state = send({
+                            "cmd": "action",
+                            "action": "select_card_reward",
+                            "args": {"card_index": 0}
+                        })
+                    else:
+                        state = send({"cmd": "action", "action": "skip_card_reward"})
 
             elif decision == "bundle_select":
                 state = send({"cmd": "action", "action": "select_bundle",

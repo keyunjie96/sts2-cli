@@ -246,6 +246,7 @@ public class RunSimulator
     // Pending rewards for card selection (populated after combat, before proceeding)
     private List<Reward>? _pendingRewards;
     private CardReward? _pendingCardReward;
+    private List<MegaCrit.Sts2.Core.Rewards.PotionReward>? _pendingPotionRewards;
     private bool _rewardsProcessed;
     private int _goldBeforeCombat;
     private int _lastKnownHp;
@@ -571,6 +572,12 @@ public class RunSimulator
                     return DoUsePotion(player, args);
                 case "discard_potion":
                     return DoDiscardPotion(player, args);
+                case "collect_potion_reward":
+                    return DoCollectPotionReward(player, args);
+                case "discard_potion_for_reward":
+                    return DoDiscardPotionForReward(player, args);
+                case "skip_potion_reward":
+                    return DoSkipPotionReward(player, args);
                 case "leave_room":
                     return DoLeaveRoom(player);
                 case "proceed":
@@ -595,6 +602,7 @@ public class RunSimulator
         // Reset tracking for new room
         _rewardsProcessed = false;
         _pendingCardReward = null;
+        _pendingPotionRewards = null;
         _eventOptionChosen = false;
         _lastEventOptionCount = 0;
         _pendingRewards = null;
@@ -1316,6 +1324,108 @@ public class RunSimulator
         return DetectDecisionPoint();
     }
 
+    private Dictionary<string, object?> DoCollectPotionReward(Player player, Dictionary<string, object?>? args)
+    {
+        if (_pendingPotionRewards == null || _pendingPotionRewards.Count == 0)
+            return Error("No pending potion rewards");
+        if (args == null || !args.ContainsKey("potion_index"))
+            return Error("collect_potion_reward requires 'potion_index'");
+
+        var idx = Convert.ToInt32(args["potion_index"]);
+        if (idx < 0 || idx >= _pendingPotionRewards.Count)
+            return Error($"Invalid potion reward index {idx}, {_pendingPotionRewards.Count} available");
+
+        // Check if potion belt has space
+        var potionsList = player.Potions?.ToList() ?? new();
+        var hasSpace = potionsList.Any(p => p == null);
+        if (!hasSpace)
+            return Error("Potion belt is full. Use 'discard_potion_for_reward' to make room first, or 'skip_potion_reward' to skip.");
+
+        var potionReward = _pendingPotionRewards[idx];
+        try
+        {
+            potionReward.OnSelectWrapper().GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            Log($"Collected potion reward: {potionReward.Potion?.Id.Entry}");
+        }
+        catch (Exception ex) { Log($"Collect potion reward: {ex.Message}"); }
+
+        _pendingPotionRewards.RemoveAt(idx);
+        if (_pendingPotionRewards.Count == 0) _pendingPotionRewards = null;
+
+        return DetectDecisionPoint();
+    }
+
+    private Dictionary<string, object?> DoDiscardPotionForReward(Player player, Dictionary<string, object?>? args)
+    {
+        if (_pendingPotionRewards == null || _pendingPotionRewards.Count == 0)
+            return Error("No pending potion rewards");
+        if (args == null || !args.ContainsKey("discard_index") || !args.ContainsKey("potion_index"))
+            return Error("discard_potion_for_reward requires 'discard_index' (belt slot to discard) and 'potion_index' (reward to collect)");
+
+        var discardIdx = Convert.ToInt32(args["discard_index"]);
+        var rewardIdx = Convert.ToInt32(args["potion_index"]);
+
+        if (rewardIdx < 0 || rewardIdx >= _pendingPotionRewards.Count)
+            return Error($"Invalid potion reward index {rewardIdx}, {_pendingPotionRewards.Count} available");
+
+        // Discard the existing potion from belt
+        var potionsList = player.Potions?.ToList() ?? new();
+        if (discardIdx < 0 || discardIdx >= potionsList.Count)
+            return Error($"Invalid belt potion index {discardIdx}");
+        var existingPotion = potionsList[discardIdx];
+        if (existingPotion == null)
+            return Error($"No potion at belt index {discardIdx}");
+
+        try
+        {
+            MegaCrit.Sts2.Core.Commands.PotionCmd.Discard(existingPotion).GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            Log($"Discarded belt potion: {existingPotion.Id.Entry} at slot {discardIdx}");
+        }
+        catch (Exception ex) { Log($"Discard belt potion: {ex.Message}"); }
+
+        // Now collect the reward potion
+        var potionReward = _pendingPotionRewards[rewardIdx];
+        try
+        {
+            potionReward.OnSelectWrapper().GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            Log($"Collected potion reward: {potionReward.Potion?.Id.Entry}");
+        }
+        catch (Exception ex) { Log($"Collect potion reward after discard: {ex.Message}"); }
+
+        _pendingPotionRewards.RemoveAt(rewardIdx);
+        if (_pendingPotionRewards.Count == 0) _pendingPotionRewards = null;
+
+        return DetectDecisionPoint();
+    }
+
+    private Dictionary<string, object?> DoSkipPotionReward(Player player, Dictionary<string, object?>? args)
+    {
+        if (_pendingPotionRewards == null || _pendingPotionRewards.Count == 0)
+            return Error("No pending potion rewards");
+
+        if (args != null && args.ContainsKey("potion_index"))
+        {
+            // Skip a specific potion reward
+            var idx = Convert.ToInt32(args["potion_index"]);
+            if (idx < 0 || idx >= _pendingPotionRewards.Count)
+                return Error($"Invalid potion reward index {idx}");
+            Log($"Skipping potion reward: {_pendingPotionRewards[idx].Potion?.Id.Entry}");
+            _pendingPotionRewards.RemoveAt(idx);
+        }
+        else
+        {
+            // Skip all remaining potion rewards
+            Log("Skipping all remaining potion rewards");
+            _pendingPotionRewards.Clear();
+        }
+
+        if (_pendingPotionRewards.Count == 0) _pendingPotionRewards = null;
+        return DetectDecisionPoint();
+    }
+
     private Dictionary<string, object?> DoChooseOption(Player player, Dictionary<string, object?>? args)
     {
         if (args == null || !args.ContainsKey("option_index"))
@@ -1549,8 +1659,8 @@ public class RunSimulator
             };
         }
 
-        // Check if there's a pending card reward
-        if (_pendingCardReward != null)
+        // Check if there's a pending card reward or pending potion rewards
+        if (_pendingCardReward != null || (_pendingPotionRewards != null && _pendingPotionRewards.Count > 0))
         {
             return CardRewardState(player, _runState.CurrentRoom as CombatRoom);
         }
@@ -2004,15 +2114,19 @@ public class RunSimulator
                 var rewards = rewardsSet.GenerateWithoutOffering().GetAwaiter().GetResult();
                 _syncCtx.Pump();
 
-                // Auto-collect gold and potions, but present card choices to agent
+                // Auto-collect gold and relics, but present card and potion choices to agent
                 var cardRewards = new List<CardReward>();
+                var potionRewards = new List<MegaCrit.Sts2.Core.Rewards.PotionReward>();
                 foreach (var reward in rewards)
                 {
-                    if (reward is GoldReward || reward is MegaCrit.Sts2.Core.Rewards.RelicReward
-                        || reward is MegaCrit.Sts2.Core.Rewards.PotionReward)
+                    if (reward is GoldReward || reward is MegaCrit.Sts2.Core.Rewards.RelicReward)
                     {
                         try { reward.OnSelectWrapper().GetAwaiter().GetResult(); _syncCtx.Pump(); }
                         catch (Exception ex) { Log($"Auto-collect reward: {ex.Message}"); }
+                    }
+                    else if (reward is MegaCrit.Sts2.Core.Rewards.PotionReward pr)
+                    {
+                        potionRewards.Add(pr);
                     }
                     else if (reward is CardReward cr)
                     {
@@ -2020,9 +2134,11 @@ public class RunSimulator
                     }
                 }
 
-                if (cardRewards.Count > 0)
+                _pendingPotionRewards = potionRewards.Count > 0 ? potionRewards : null;
+
+                if (cardRewards.Count > 0 || potionRewards.Count > 0)
                 {
-                    _pendingCardReward = cardRewards[0];
+                    _pendingCardReward = cardRewards.Count > 0 ? cardRewards[0] : null;
                     _pendingRewards = rewards;
                     return CardRewardState(player, combatRoom);
                 }
@@ -2034,6 +2150,7 @@ public class RunSimulator
 
         // No more pending rewards — proceed
         _pendingCardReward = null;
+        _pendingPotionRewards = null;
         _pendingRewards = null;
         _rewardsProcessed = true;
 
@@ -2058,21 +2175,62 @@ public class RunSimulator
 
     private Dictionary<string, object?> CardRewardState(Player player, CombatRoom? combatRoom)
     {
-        if (_pendingCardReward == null)
+        // If no card reward AND no potion rewards, proceed past combat
+        if (_pendingCardReward == null && (_pendingPotionRewards == null || _pendingPotionRewards.Count == 0))
             return DetectPostCombatState(player, combatRoom ?? (_runState?.CurrentRoom as CombatRoom)!);
 
-        var cards = _pendingCardReward.Cards.Select((c, i) => SerializeCard(c, i)).ToList();
+        var cards = _pendingCardReward?.Cards.Select((c, i) => SerializeCard(c, i)).ToList()
+                    ?? new List<Dictionary<string, object?>>();
 
-        return new Dictionary<string, object?>
+        // Serialize pending potion rewards
+        var potionRewardsList = new List<Dictionary<string, object?>>();
+        if (_pendingPotionRewards != null)
+        {
+            for (int i = 0; i < _pendingPotionRewards.Count; i++)
+            {
+                var pr = _pendingPotionRewards[i];
+                try
+                {
+                    var potionModel = pr.Potion;
+                    potionRewardsList.Add(new Dictionary<string, object?>
+                    {
+                        ["index"] = i,
+                        ["id"] = potionModel?.Id.Entry,
+                        ["name"] = _loc.Potion(potionModel?.Id.Entry ?? "?"),
+                        ["description"] = _loc.Bilingual("potions", (potionModel?.Id.Entry ?? "?") + ".description"),
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Log($"Serialize potion reward {i}: {ex.Message}");
+                    potionRewardsList.Add(new Dictionary<string, object?>
+                    {
+                        ["index"] = i,
+                        ["name"] = "Unknown Potion",
+                        ["description"] = "",
+                    });
+                }
+            }
+        }
+
+        // Determine if potion belt is full
+        var potionsList = player.Potions?.ToList() ?? new();
+        var potionSlotsFull = potionsList.All(p => p != null);
+
+        var result = new Dictionary<string, object?>
         {
             ["type"] = "decision",
             ["decision"] = "card_reward",
             ["context"] = RunContext(),
             ["cards"] = cards,
-            ["can_skip"] = _pendingCardReward.CanSkip,
+            ["can_skip"] = _pendingCardReward?.CanSkip ?? true,
             ["gold_earned"] = _runState!.Players[0].Gold - _goldBeforeCombat,
+            ["potion_rewards"] = potionRewardsList.Count > 0 ? potionRewardsList : null,
+            ["potion_slots_full"] = potionSlotsFull,
             ["player"] = PlayerSummary(_runState!.Players[0]),
         };
+
+        return result;
     }
 
     private void ForceToMap()

@@ -600,6 +600,19 @@ def show_card_reward(state):
         if aug_parts:
             print(f"      {c(t('upgrade:','升级:'), 'green')} {', '.join(aug_parts)}")
 
+    # Show potion rewards if any
+    potion_rewards = state.get("potion_rewards")
+    if potion_rewards:
+        slots_full = state.get("potion_slots_full", False)
+        print()
+        print(f"  {c(t('Potion Rewards','药水奖励'), 'bold')}" +
+              (f" {c(t('(belt full!)','(药水栏已满!)'), 'red')}" if slots_full else ""))
+        for pr in potion_rewards:
+            desc = n(pr.get("description", ""))
+            print(f"  [p{pr['index']}] {c(n(pr.get('name', '?')), 'cyan')}")
+            if desc:
+                print(f"       {c(desc, 'dim')}")
+
 def show_shop(state):
     print(f"\n{'─' * 60}")
     print(f"  {c(t('Shop','商店'), 'bold')}")
@@ -1189,19 +1202,83 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True):
             elif dec == "card_reward":
                 show_card_reward(state)
                 cards = state.get("cards", [])
-                valid = {str(c["index"]): c for c in cards}
+                potion_rewards = state.get("potion_rewards") or []
+                slots_full = state.get("potion_slots_full", False)
+
+                # Handle potion rewards first if present and no cards
+                # or let player handle both
+                valid = {str(c_["index"]): c_ for c_ in cards}
                 valid["s"] = None  # skip
+                for pr in potion_rewards:
+                    valid[f"p{pr['index']}"] = pr
+                if potion_rewards:
+                    valid["sp"] = None  # skip all potions
 
                 if auto:
-                    choice = "0" if cards else "s"
+                    # Auto mode: collect potions if space, then pick first card or skip
+                    for pr in potion_rewards:
+                        if not slots_full:
+                            state = send({"cmd": "action", "action": "collect_potion_reward",
+                                         "args": {"potion_index": pr["index"]}})
+                            # Refresh state after collecting
+                            potion_rewards = state.get("potion_rewards") or []
+                            slots_full = state.get("potion_slots_full", False)
+                            if state.get("decision") != "card_reward":
+                                break
+                        else:
+                            state = send({"cmd": "action", "action": "skip_potion_reward",
+                                         "args": {"potion_index": pr["index"]}})
+                            potion_rewards = state.get("potion_rewards") or []
+                            if state.get("decision") != "card_reward":
+                                break
+                    if state.get("decision") == "card_reward":
+                        cards = state.get("cards", [])
+                        if cards:
+                            state = send({"cmd": "action", "action": "select_card_reward",
+                                         "args": {"card_index": 0}})
+                        else:
+                            state = send({"cmd": "action", "action": "skip_card_reward"})
                 else:
-                    choice = get_input(t("Pick card [index] or (s)kip", "选择卡牌 [编号] 或 (s)跳过"), set(valid.keys()), state=state)
+                    prompt_parts = []
+                    if cards:
+                        prompt_parts.append(t("card [index]", "卡牌 [编号]"))
+                    if potion_rewards:
+                        prompt_parts.append(t("potion [p0,p1..]", "药水 [p0,p1..]"))
+                        if slots_full:
+                            prompt_parts.append(t("discard belt+collect [d]", "丢弃药水栏+拾取 [d]"))
+                    prompt_parts.append(t("(s)kip cards", "(s)跳过卡牌"))
+                    if potion_rewards:
+                        prompt_parts.append(t("(sp)skip potions", "(sp)跳过药水"))
+                    prompt = ", ".join(prompt_parts)
 
-                if choice == "s":
-                    state = send({"cmd": "action", "action": "skip_card_reward"})
-                else:
-                    state = send({"cmd": "action", "action": "select_card_reward",
-                                 "args": {"card_index": int(choice)}})
+                    choice = get_input(prompt, set(valid.keys()) | {"d"}, state=state)
+
+                    if choice == "s":
+                        state = send({"cmd": "action", "action": "skip_card_reward"})
+                    elif choice == "sp":
+                        state = send({"cmd": "action", "action": "skip_potion_reward"})
+                    elif choice == "d":
+                        # Discard a belt potion then collect a reward potion
+                        player_potions = state.get("player", {}).get("potions", [])
+                        if player_potions:
+                            print(f"\n  {c(t('Belt potions:','药水栏:'), 'bold')}")
+                            for bp in player_potions:
+                                print(f"    [{bp['index']}] {c(n(bp.get('name','?')), 'cyan')}")
+                            belt_valid = {str(bp["index"]) for bp in player_potions}
+                            belt_choice = get_input(t("Discard which belt potion?", "丢弃哪个药水?"), belt_valid, state=state)
+                            rew_valid = {str(pr["index"]) for pr in potion_rewards}
+                            rew_choice = get_input(t("Collect which reward potion?", "拾取哪个奖励药水?"), rew_valid, state=state)
+                            state = send({"cmd": "action", "action": "discard_potion_for_reward",
+                                         "args": {"discard_index": int(belt_choice), "potion_index": int(rew_choice)}})
+                        else:
+                            print(f"  {c(t('No belt potions to discard','没有药水可丢弃'), 'red')}")
+                    elif choice.startswith("p") and choice[1:].isdigit():
+                        pidx = int(choice[1:])
+                        state = send({"cmd": "action", "action": "collect_potion_reward",
+                                     "args": {"potion_index": pidx}})
+                    else:
+                        state = send({"cmd": "action", "action": "select_card_reward",
+                                     "args": {"card_index": int(choice)}})
 
             elif dec == "bundle_select":
                 print(f"\n{'─' * 60}")
