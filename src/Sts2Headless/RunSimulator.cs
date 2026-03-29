@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Reflection;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Commands;
@@ -192,6 +193,7 @@ public class RunSimulator
     private static readonly InlineSynchronizationContext _syncCtx = new();
     private readonly ManualResetEventSlim _turnStarted = new(false);
     private readonly ManualResetEventSlim _combatEnded = new(false);
+    private int _consecutiveForceStarts;
     private static readonly LocLookup _loc = new();
     private bool _eventOptionChosen;
     private int _lastEventOptionCount;
@@ -638,14 +640,63 @@ public class RunSimulator
                 Thread.Sleep(100);
                 _syncCtx.Pump();
                 if (!CombatManager.Instance.IsPlayPhase)
+                {
+                    // The game is stuck between phases. The enemy turn may have
+                    // completed but the transition back to play phase failed.
+                    // Try SuppressYield pump to complete pending async continuations,
+                    // then ForceStartNextTurn if still stuck.
+                    Log($"DoEndTurn: IsPlayPhase false after 100ms pump. Trying SuppressYield recovery.");
+                    YieldPatches.SuppressYield = true;
+                    try
+                    {
+                        // Quick SuppressYield pump (up to ~200ms)
+                        for (int i = 0; i < 50; i++)
+                        {
+                            _syncCtx.Pump();
+                            if (CombatManager.Instance.IsPlayPhase) break;
+                            if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
+                            Thread.Sleep(1);
+                        }
+                        if (!CombatManager.Instance.IsPlayPhase && CombatManager.Instance.IsInProgress
+                            && (player.Creature == null || !player.Creature.IsDead))
+                        {
+                            // SuppressYield pump didn't help — force-start next turn
+                            Log("DoEndTurn: SuppressYield pump failed. Calling ForceStartNextTurn.");
+                            var earlyRound = CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0;
+                            ForceStartNextTurn(player);
+                            _syncCtx.Pump();
+                            // Brief pump for StartTurn to complete
+                            for (int i = 0; i < 100; i++)
+                            {
+                                _syncCtx.Pump();
+                                if (CombatManager.Instance.IsPlayPhase) break;
+                                if (!CombatManager.Instance.IsInProgress || (player.Creature != null && player.Creature.IsDead)) break;
+                                if (i % 10 == 9) Thread.Sleep(1);
+                            }
+                            // Verify round advanced
+                            var earlyRoundAfter = CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0;
+                            if (earlyRoundAfter <= earlyRound && CombatManager.Instance.IsInProgress)
+                                ForceIncrementRound(earlyRound);
+                            if (CombatManager.Instance.IsPlayPhase)
+                                Log($"DoEndTurn: ForceStartNextTurn recovered play phase (round={earlyRoundAfter})");
+                            else
+                                Log($"DoEndTurn: ForceStartNextTurn did not recover play phase");
+                        }
+                    }
+                    finally
+                    {
+                        YieldPatches.SuppressYield = false;
+                    }
                     return DetectDecisionPoint();
+                }
             }
         }
 
         // Ensure no actions are still running before ending turn
         WaitForActionExecutor();
 
-        Log($"Ending turn (round={CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0})");
+        var roundBefore = CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0;
+        Log($"Ending turn (round={roundBefore})");
         _turnStarted.Reset();
         _combatEnded.Reset();
 
@@ -667,14 +718,26 @@ public class RunSimulator
             // SuppressYield stays true the entire time so async continuations
             // (Task.Yield in AfterAllPlayersReadyToBeginEnemyTurn, SwitchFromPlayerToEnemySide,
             // StartTurn, etc.) all execute inline synchronously.
+            //
+            // Wall-clock timeout (10s) prevents the end-turn hang variant where
+            // the async chain deadlocks and the pump loop never exits.
             bool resolved = false;
             int emptyPumps = 0;
+            var pumpTimer = Stopwatch.StartNew();
             for (int i = 0; i < 2000; i++)
             {
                 _syncCtx.Pump();
                 if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) { resolved = true; break; }
                 if (_combatEnded.IsSet) { resolved = true; break; }
                 if (CombatManager.Instance.IsPlayPhase) { resolved = true; break; }
+
+                // Wall-clock timeout: if we've been pumping for over 10 seconds,
+                // the async chain is deadlocked. Break out and force-recover.
+                if (pumpTimer.ElapsedMilliseconds > 10_000)
+                {
+                    Log($"EndTurn pump loop wall-clock timeout after {pumpTimer.ElapsedMilliseconds}ms");
+                    break;
+                }
 
                 // Early exit: if the sync context queue is drained and the executor isn't
                 // running, the async chain has stalled (likely NRE). No point pumping further.
@@ -698,8 +761,8 @@ public class RunSimulator
             if (!resolved)
             {
                 Log("EndTurn did not resolve after pumping — checking executor");
-                // Wait for the action executor to finish processing
-                WaitForActionExecutor();
+                // Wait for the action executor to finish processing (with timeout)
+                WaitForActionExecutor(timeoutMs: 3000);
                 _syncCtx.Pump();
 
                 // One more check
@@ -709,34 +772,98 @@ public class RunSimulator
 
             if (!resolved)
             {
-                Log($"EndTurn not resolved after pumping. IsPlayPhase={CombatManager.Instance.IsPlayPhase}, " +
-                    $"IsInProgress={CombatManager.Instance.IsInProgress}, ActionExecutor.IsRunning={RunManager.Instance.ActionExecutor.IsRunning}");
+                _consecutiveForceStarts++;
+                Log($"EndTurn not resolved after pumping (consecutiveForceStarts={_consecutiveForceStarts}). " +
+                    $"IsPlayPhase={CombatManager.Instance.IsPlayPhase}, " +
+                    $"IsInProgress={CombatManager.Instance.IsInProgress}, " +
+                    $"ActionExecutor.IsRunning={RunManager.Instance.ActionExecutor.IsRunning}");
 
-                // The turn transition failed (likely NRE in async chain).
-                // Force-start the next turn by calling StartTurn directly via reflection.
-                try
+                // If we've needed ForceStartNextTurn too many times, the combat is
+                // unrecoverably broken — end_turn never completes naturally. Kill the
+                // player to end the fight rather than looping for hundreds of steps.
+                if (_consecutiveForceStarts > 5 && CombatManager.Instance.IsInProgress)
                 {
-                    ForceStartNextTurn(player);
-                    _syncCtx.Pump();
-
-                    // Pump until play phase resumes
-                    for (int i = 0; i < 2000; i++)
+                    Log($"Combat unrecoverable after {_consecutiveForceStarts} consecutive force-starts. Killing player.");
+                    try
                     {
+                        // CurrentHp is read-only — set via reflection
+                        var creature = player.Creature;
+                        var hpProp = creature.GetType().GetProperty("CurrentHp", BindingFlags.Public | BindingFlags.Instance);
+                        if (hpProp != null && hpProp.CanWrite)
+                        {
+                            hpProp.SetValue(creature, 0);
+                        }
+                        else
+                        {
+                            // Try backing field
+                            var hpField = creature.GetType().GetField("_currentHp", BindingFlags.NonPublic | BindingFlags.Instance)
+                                       ?? creature.GetType().GetField("<CurrentHp>k__BackingField", BindingFlags.NonPublic | BindingFlags.Instance);
+                            hpField?.SetValue(creature, 0);
+                        }
                         _syncCtx.Pump();
-                        if (_turnStarted.IsSet || _combatEnded.IsSet) { resolved = true; break; }
-                        if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) { resolved = true; break; }
-                        if (CombatManager.Instance.IsPlayPhase) { resolved = true; break; }
-                        if (i % 10 == 9) Thread.Sleep(1);
                     }
-
-                    if (resolved)
-                        Log("Force-StartTurn succeeded");
-                    else
-                        Log("Force-StartTurn did not resolve");
+                    catch (Exception ex)
+                    {
+                        Log($"Kill player failed: {ex.Message}");
+                    }
+                    resolved = true;
                 }
-                catch (Exception ex)
+                else
                 {
-                    Log($"Force-StartTurn failed: {ex.Message}");
+                    // The turn transition failed (likely NRE in async chain).
+                    // Force-start the next turn by calling StartTurn directly via reflection.
+                    try
+                    {
+                        ForceStartNextTurn(player);
+                        _syncCtx.Pump();
+
+                        // Pump until play phase resumes (with wall-clock timeout)
+                        var forceTimer = Stopwatch.StartNew();
+                        for (int i = 0; i < 2000; i++)
+                        {
+                            _syncCtx.Pump();
+                            if (_turnStarted.IsSet || _combatEnded.IsSet) { resolved = true; break; }
+                            if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) { resolved = true; break; }
+                            if (CombatManager.Instance.IsPlayPhase) { resolved = true; break; }
+                            if (forceTimer.ElapsedMilliseconds > 5_000)
+                            {
+                                Log($"ForceStartNextTurn pump loop wall-clock timeout after {forceTimer.ElapsedMilliseconds}ms");
+                                // Even though pumping timed out, if IsPlayPhase is true now, we're OK
+                                if (CombatManager.Instance.IsPlayPhase) resolved = true;
+                                break;
+                            }
+                            if (i % 10 == 9) Thread.Sleep(1);
+                        }
+
+                        if (resolved)
+                            Log("Force-StartTurn succeeded");
+                        else
+                            Log("Force-StartTurn did not resolve");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"Force-StartTurn failed: {ex.Message}");
+                    }
+                }
+            }
+            else
+            {
+                // End turn resolved normally — reset the force-start counter
+                _consecutiveForceStarts = 0;
+            }
+
+            // ROUND-STUCK GUARD: Verify the round actually advanced after end_turn.
+            // If ForceStartNextTurn fired but the round didn't increment (e.g., because
+            // the RoundNumber property wasn't writable via reflection), force it now.
+            if (resolved && CombatManager.Instance.IsInProgress && CombatManager.Instance.IsPlayPhase)
+            {
+                var roundAfter = CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0;
+                if (roundAfter <= roundBefore)
+                {
+                    Log($"Round did not advance (before={roundBefore}, after={roundAfter}). Force-incrementing.");
+                    ForceIncrementRound(roundBefore);
+                    var roundFixed = CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0;
+                    Log($"Round after force-increment: {roundFixed}");
                 }
             }
         }
@@ -2219,19 +2346,36 @@ public class RunSimulator
         if (state != null)
         {
             var stateType = state.GetType();
-            // Increment round number
+            // Increment round number — try property first, then backing field
             var roundProp = stateType.GetProperty("RoundNumber", BindingFlags.Public | BindingFlags.Instance);
             if (roundProp != null && roundProp.CanWrite)
             {
                 var currentRound = (int)(roundProp.GetValue(state) ?? 0);
                 roundProp.SetValue(state, currentRound + 1);
+                Log($"ForceStartNextTurn: incremented RoundNumber via property {currentRound} -> {currentRound + 1}");
+            }
+            else
+            {
+                // Property not writable — try backing field directly
+                var roundField = stateType.GetField("_roundNumber", BindingFlags.NonPublic | BindingFlags.Instance)
+                              ?? stateType.GetField("<RoundNumber>k__BackingField", BindingFlags.NonPublic | BindingFlags.Instance);
+                if (roundField != null)
+                {
+                    var currentRound = (int)(roundField.GetValue(state) ?? 0);
+                    roundField.SetValue(state, currentRound + 1);
+                    Log($"ForceStartNextTurn: incremented RoundNumber via field {currentRound} -> {currentRound + 1}");
+                }
+                else
+                {
+                    Log("ForceStartNextTurn: WARNING — could not find writable RoundNumber property or backing field");
+                }
             }
             // Switch side back to Player (1)
             var sideProp = stateType.GetProperty("CurrentSide", BindingFlags.Public | BindingFlags.Instance);
             sideProp?.SetValue(state, (MegaCrit.Sts2.Core.Combat.CombatSide)1);
         }
 
-        // Call StartTurn via reflection
+        // Call StartTurn via reflection (with wall-clock timeout to prevent hang)
         var startTurnMethod = cmType.GetMethod("StartTurn", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
         if (startTurnMethod != null)
         {
@@ -2240,12 +2384,18 @@ public class RunSimulator
             if (task != null)
             {
                 _syncCtx.Pump();
-                // Pump until task completes or play phase resumes
+                // Pump until task completes or play phase resumes (wall-clock timeout 5s)
+                var startTurnTimer = Stopwatch.StartNew();
                 for (int i = 0; i < 500; i++)
                 {
                     _syncCtx.Pump();
                     if (task.IsCompleted) break;
                     if (CombatManager.Instance.IsPlayPhase) break;
+                    if (startTurnTimer.ElapsedMilliseconds > 5_000)
+                    {
+                        Log($"ForceStartNextTurn: StartTurn pump timed out after {startTurnTimer.ElapsedMilliseconds}ms");
+                        break;
+                    }
                     Thread.Sleep(1);
                 }
             }
@@ -2256,7 +2406,69 @@ public class RunSimulator
         }
     }
 
-    private void WaitForActionExecutor()
+    /// <summary>
+    /// Defensive fallback: force-increment the round number if the normal end_turn path
+    /// (or ForceStartNextTurn) left the round unchanged. This prevents the round-stuck loop
+    /// where end_turn returns combat_play but the round never advances.
+    /// </summary>
+    private void ForceIncrementRound(int roundBefore)
+    {
+        try
+        {
+            var cm = CombatManager.Instance;
+
+            // First try via DebugOnlyGetState() which returns the public state object
+            var state = cm.DebugOnlyGetState();
+            if (state != null)
+            {
+                var stateType = state.GetType();
+                var roundProp = stateType.GetProperty("RoundNumber", BindingFlags.Public | BindingFlags.Instance);
+                if (roundProp != null && roundProp.CanWrite)
+                {
+                    roundProp.SetValue(state, roundBefore + 1);
+                    return;
+                }
+                // Try backing field
+                var roundField = stateType.GetField("_roundNumber", BindingFlags.NonPublic | BindingFlags.Instance)
+                              ?? stateType.GetField("<RoundNumber>k__BackingField", BindingFlags.NonPublic | BindingFlags.Instance);
+                if (roundField != null)
+                {
+                    roundField.SetValue(state, roundBefore + 1);
+                    return;
+                }
+            }
+
+            // Fallback: try via the private _state field on CombatManager
+            var cmType = cm.GetType();
+            var stateField = cmType.GetField("_state", BindingFlags.NonPublic | BindingFlags.Instance);
+            var privateState = stateField?.GetValue(cm);
+            if (privateState != null)
+            {
+                var pType = privateState.GetType();
+                var rProp = pType.GetProperty("RoundNumber", BindingFlags.Public | BindingFlags.Instance);
+                if (rProp != null && rProp.CanWrite)
+                {
+                    rProp.SetValue(privateState, roundBefore + 1);
+                    return;
+                }
+                var rField = pType.GetField("_roundNumber", BindingFlags.NonPublic | BindingFlags.Instance)
+                          ?? pType.GetField("<RoundNumber>k__BackingField", BindingFlags.NonPublic | BindingFlags.Instance);
+                if (rField != null)
+                {
+                    rField.SetValue(privateState, roundBefore + 1);
+                    return;
+                }
+            }
+
+            Log("ForceIncrementRound: could not find any writable round field");
+        }
+        catch (Exception ex)
+        {
+            Log($"ForceIncrementRound failed: {ex.Message}");
+        }
+    }
+
+    private void WaitForActionExecutor(int timeoutMs = 5000)
     {
         try
         {
@@ -2269,13 +2481,19 @@ public class RunSimulator
             var executor = RunManager.Instance.ActionExecutor;
             if (executor.IsRunning)
             {
-                // Pump while waiting for executor
+                // Pump while waiting for executor (with wall-clock timeout)
                 int maxPumps = 1000;
+                var timer = Stopwatch.StartNew();
                 for (int i = 0; i < maxPumps; i++)
                 {
                     _syncCtx.Pump();
                     if (!executor.IsRunning) break;
                     if (_cardSelector.HasPending) break;
+                    if (timer.ElapsedMilliseconds > timeoutMs)
+                    {
+                        Log($"WaitForActionExecutor timed out after {timer.ElapsedMilliseconds}ms");
+                        break;
+                    }
                     Thread.Sleep(1);
                 }
             }
