@@ -2275,6 +2275,7 @@ public class RunSimulator
                 {
                     _syncCtx.Pump();
                     if (!executor.IsRunning) break;
+                    if (_cardSelector.HasPending) break;
                     Thread.Sleep(1);
                 }
             }
