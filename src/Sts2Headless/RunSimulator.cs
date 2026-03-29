@@ -130,6 +130,54 @@ internal class InlineSynchronizationContext : SynchronizationContext
         if (_queue.Count > 0)
             Console.Error.WriteLine($"[WARN] SyncCtx.Pump hit limit ({MaxDrainPerCycle}), {_queue.Count} callbacks remaining");
     }
+
+    /// <summary>
+    /// Pump with a per-callback timeout. If any single callback takes longer than
+    /// <paramref name="perCallbackTimeoutMs"/>, we abandon it (it runs on a thread
+    /// we can't kill, but we stop waiting) and skip remaining callbacks to return
+    /// control to the caller. Returns false if a timeout occurred.
+    /// </summary>
+    public bool PumpWithTimeout(int perCallbackTimeoutMs = 3000)
+    {
+        int drained = 0;
+        bool timedOut = false;
+        while (_queue.Count > 0 && drained < MaxDrainPerCycle)
+        {
+            var (cb, st) = _queue.Dequeue();
+            _executing = true;
+            try
+            {
+                // Run the callback on a ThreadPool thread so we can time-box it
+                var done = new ManualResetEventSlim(false);
+                Exception? cbException = null;
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    try { cb(st); }
+                    catch (Exception ex) { cbException = ex; }
+                    finally { done.Set(); }
+                });
+                if (!done.Wait(perCallbackTimeoutMs))
+                {
+                    Console.Error.WriteLine($"[WARN] SyncCtx.PumpWithTimeout: callback timed out after {perCallbackTimeoutMs}ms, abandoning remaining queue ({_queue.Count} items)");
+                    timedOut = true;
+                    _executing = false;
+                    break;
+                }
+                if (cbException != null)
+                    Console.Error.WriteLine($"[WARN] SyncCtx.PumpWithTimeout callback threw: {cbException.GetType().Name}: {cbException.Message}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[WARN] SyncCtx.PumpWithTimeout threw: {ex.GetType().Name}: {ex.Message}");
+            }
+            finally
+            {
+                _executing = false;
+            }
+            drained++;
+        }
+        return !timedOut;
+    }
 }
 
 /// <summary>
@@ -713,7 +761,32 @@ public class RunSimulator
 
         var playAction = new PlayCardAction(card, target);
         RunManager.Instance.ActionQueueSet.EnqueueWithoutSynchronizing(playAction);
-        WaitForActionExecutor();
+
+        // Hard timeout for play_card: WaitForActionExecutor can hang if a callback
+        // in the sync context blocks. Use a reduced timeout and a Stopwatch-based
+        // outer guard.
+        var playCardTimer = Stopwatch.StartNew();
+        WaitForActionExecutor(timeoutMs: 2000);
+
+        // If WaitForActionExecutor timed out but combat ended or player died, that's fine
+        if (playCardTimer.ElapsedMilliseconds > 2000)
+        {
+            Log($"DoPlayCard: WaitForActionExecutor exceeded 2s ({playCardTimer.ElapsedMilliseconds}ms). Checking state...");
+            // Extra pump with timeout to try to unstick
+            _syncCtx.PumpWithTimeout(perCallbackTimeoutMs: 1000);
+        }
+
+        // Hard timeout: if play_card has taken more than 10s total, force-recover
+        if (playCardTimer.ElapsedMilliseconds > 10_000)
+        {
+            Log($"DoPlayCard HARD TIMEOUT after {playCardTimer.ElapsedMilliseconds}ms");
+            // If combat is somehow stuck, don't hang — just return current state
+            if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead)
+            {
+                return DetectDecisionPoint();
+            }
+            // Combat still running — return what we have (the card may or may not have played)
+        }
 
         // Check if card play had no effect (hand unchanged, same card still at same index)
         var handAfter = pcs.Hand.Cards;
@@ -727,6 +800,13 @@ public class RunSimulator
 
     private Dictionary<string, object?> DoEndTurn(Player player)
     {
+        // HARD wall-clock timeout: the entire DoEndTurn must complete within 15s.
+        // This catches cases where _syncCtx.Pump() itself blocks on a deadlocked
+        // callback — the inner Stopwatch-based timeouts can't fire in that scenario
+        // because they only check between pump iterations.
+        var hardTimer = Stopwatch.StartNew();
+        const int HARD_TIMEOUT_MS = 15_000;
+
         if (!CombatManager.Instance.IsPlayPhase)
         {
             // Might be between phases — pump and check
@@ -736,25 +816,38 @@ public class RunSimulator
                 if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead)
                     return DetectDecisionPoint();
                 // Brief wait for ThreadPool if sync context didn't catch it
-                Thread.Sleep(100);
+                Thread.Sleep(50);
                 _syncCtx.Pump();
                 if (!CombatManager.Instance.IsPlayPhase)
                 {
                     // The game is stuck between phases. The enemy turn may have
                     // completed but the transition back to play phase failed.
-                    // Try SuppressYield pump to complete pending async continuations,
-                    // then ForceStartNextTurn if still stuck.
-                    Log($"DoEndTurn: IsPlayPhase false after 100ms pump. Trying SuppressYield recovery.");
+                    // Track consecutive early-path force-starts to detect unrecoverable
+                    // loops where ForceStartNextTurn never recovers play phase.
+                    _consecutiveForceStarts++;
+                    Log($"DoEndTurn: IsPlayPhase false after 50ms pump (consecutiveForceStarts={_consecutiveForceStarts}). Trying SuppressYield recovery.");
+
+                    // Kill-switch: if the early recovery path has been hit too many times
+                    // in a row, the combat is unrecoverable. Kill the player.
+                    if (_consecutiveForceStarts > 3 && CombatManager.Instance.IsInProgress)
+                    {
+                        Log($"DoEndTurn early path: combat unrecoverable after {_consecutiveForceStarts} consecutive force-starts. Killing player.");
+                        ForceKillPlayer(player);
+                        return DetectDecisionPoint();
+                    }
+
                     YieldPatches.SuppressYield = true;
                     try
                     {
-                        // Quick SuppressYield pump (up to ~200ms)
-                        for (int i = 0; i < 50; i++)
+                        // Quick SuppressYield pump (up to ~200ms with Stopwatch)
+                        var earlyPumpTimer = Stopwatch.StartNew();
+                        for (int i = 0; i < 200; i++)
                         {
                             _syncCtx.Pump();
                             if (CombatManager.Instance.IsPlayPhase) break;
                             if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                            Thread.Sleep(1);
+                            if (earlyPumpTimer.ElapsedMilliseconds > 200) break;
+                            Thread.Sleep(0); // yield timeslice without 15ms sleep penalty
                         }
                         if (!CombatManager.Instance.IsPlayPhase && CombatManager.Instance.IsInProgress
                             && (player.Creature == null || !player.Creature.IsDead))
@@ -765,21 +858,30 @@ public class RunSimulator
                             ForceStartNextTurn(player);
                             _syncCtx.Pump();
                             // Brief pump for StartTurn to complete
-                            for (int i = 0; i < 100; i++)
+                            var startPumpTimer = Stopwatch.StartNew();
+                            for (int i = 0; i < 500; i++)
                             {
                                 _syncCtx.Pump();
                                 if (CombatManager.Instance.IsPlayPhase) break;
                                 if (!CombatManager.Instance.IsInProgress || (player.Creature != null && player.Creature.IsDead)) break;
-                                if (i % 10 == 9) Thread.Sleep(1);
+                                if (startPumpTimer.ElapsedMilliseconds > 1000) break;
+                                Thread.Sleep(0);
                             }
                             // Verify round advanced
                             var earlyRoundAfter = CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0;
                             if (earlyRoundAfter <= earlyRound && CombatManager.Instance.IsInProgress)
                                 ForceIncrementRound(earlyRound);
                             if (CombatManager.Instance.IsPlayPhase)
+                            {
                                 Log($"DoEndTurn: ForceStartNextTurn recovered play phase (round={earlyRoundAfter})");
+                                _consecutiveForceStarts = 0; // recovered — reset counter
+                            }
                             else
                                 Log($"DoEndTurn: ForceStartNextTurn did not recover play phase");
+                        }
+                        else if (CombatManager.Instance.IsPlayPhase)
+                        {
+                            _consecutiveForceStarts = 0; // recovered — reset counter
                         }
                     }
                     finally
@@ -792,7 +894,7 @@ public class RunSimulator
         }
 
         // Ensure no actions are still running before ending turn
-        WaitForActionExecutor();
+        WaitForActionExecutor(timeoutMs: 2000);
 
         var roundBefore = CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0;
         Log($"Ending turn (round={roundBefore})");
@@ -818,23 +920,30 @@ public class RunSimulator
             // (Task.Yield in AfterAllPlayersReadyToBeginEnemyTurn, SwitchFromPlayerToEnemySide,
             // StartTurn, etc.) all execute inline synchronously.
             //
-            // Wall-clock timeout (10s) prevents the end-turn hang variant where
+            // Wall-clock timeout (8s) prevents the end-turn hang variant where
             // the async chain deadlocks and the pump loop never exits.
             bool resolved = false;
             int emptyPumps = 0;
             var pumpTimer = Stopwatch.StartNew();
-            for (int i = 0; i < 2000; i++)
+            for (int i = 0; i < 5000; i++)
             {
                 _syncCtx.Pump();
                 if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) { resolved = true; break; }
                 if (_combatEnded.IsSet) { resolved = true; break; }
                 if (CombatManager.Instance.IsPlayPhase) { resolved = true; break; }
 
-                // Wall-clock timeout: if we've been pumping for over 10 seconds,
+                // Wall-clock timeout: if we've been pumping for over 8 seconds,
                 // the async chain is deadlocked. Break out and force-recover.
-                if (pumpTimer.ElapsedMilliseconds > 10_000)
+                if (pumpTimer.ElapsedMilliseconds > 8_000)
                 {
                     Log($"EndTurn pump loop wall-clock timeout after {pumpTimer.ElapsedMilliseconds}ms");
+                    break;
+                }
+
+                // HARD timeout check — if the entire DoEndTurn has exceeded 15s, bail immediately
+                if (hardTimer.ElapsedMilliseconds > HARD_TIMEOUT_MS)
+                {
+                    Log($"DoEndTurn HARD TIMEOUT after {hardTimer.ElapsedMilliseconds}ms in main pump loop");
                     break;
                 }
 
@@ -854,14 +963,14 @@ public class RunSimulator
                 }
                 catch { }
 
-                if (i % 10 == 9) Thread.Sleep(1);
+                Thread.Sleep(0); // yield timeslice without 15ms sleep penalty
             }
 
             if (!resolved)
             {
                 Log("EndTurn did not resolve after pumping — checking executor");
                 // Wait for the action executor to finish processing (with timeout)
-                WaitForActionExecutor(timeoutMs: 3000);
+                WaitForActionExecutor(timeoutMs: 2000);
                 _syncCtx.Pump();
 
                 // One more check
@@ -877,34 +986,17 @@ public class RunSimulator
                     $"IsInProgress={CombatManager.Instance.IsInProgress}, " +
                     $"ActionExecutor.IsRunning={RunManager.Instance.ActionExecutor.IsRunning}");
 
+                // HARD timeout — if we've already burned most of our budget, skip ForceStart
+                // and go straight to killing the player to end combat
+                bool hardTimeoutKill = hardTimer.ElapsedMilliseconds > HARD_TIMEOUT_MS - 2000;
+
                 // If we've needed ForceStartNextTurn too many times, the combat is
                 // unrecoverably broken — end_turn never completes naturally. Kill the
                 // player to end the fight rather than looping for hundreds of steps.
-                if (_consecutiveForceStarts > 5 && CombatManager.Instance.IsInProgress)
+                if ((hardTimeoutKill || _consecutiveForceStarts > 5) && CombatManager.Instance.IsInProgress)
                 {
-                    Log($"Combat unrecoverable after {_consecutiveForceStarts} consecutive force-starts. Killing player.");
-                    try
-                    {
-                        // CurrentHp is read-only — set via reflection
-                        var creature = player.Creature;
-                        var hpProp = creature.GetType().GetProperty("CurrentHp", BindingFlags.Public | BindingFlags.Instance);
-                        if (hpProp != null && hpProp.CanWrite)
-                        {
-                            hpProp.SetValue(creature, 0);
-                        }
-                        else
-                        {
-                            // Try backing field
-                            var hpField = creature.GetType().GetField("_currentHp", BindingFlags.NonPublic | BindingFlags.Instance)
-                                       ?? creature.GetType().GetField("<CurrentHp>k__BackingField", BindingFlags.NonPublic | BindingFlags.Instance);
-                            hpField?.SetValue(creature, 0);
-                        }
-                        _syncCtx.Pump();
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"Kill player failed: {ex.Message}");
-                    }
+                    Log($"Combat unrecoverable (consecutiveForceStarts={_consecutiveForceStarts}, hardTimeout={hardTimeoutKill}). Killing player.");
+                    ForceKillPlayer(player);
                     resolved = true;
                 }
                 else
@@ -918,23 +1010,36 @@ public class RunSimulator
 
                         // Pump until play phase resumes (with wall-clock timeout)
                         var forceTimer = Stopwatch.StartNew();
-                        for (int i = 0; i < 2000; i++)
+                        for (int i = 0; i < 5000; i++)
                         {
                             _syncCtx.Pump();
                             if (_turnStarted.IsSet || _combatEnded.IsSet) { resolved = true; break; }
                             if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) { resolved = true; break; }
                             if (CombatManager.Instance.IsPlayPhase) { resolved = true; break; }
-                            if (forceTimer.ElapsedMilliseconds > 5_000)
+                            if (forceTimer.ElapsedMilliseconds > 3_000)
                             {
                                 Log($"ForceStartNextTurn pump loop wall-clock timeout after {forceTimer.ElapsedMilliseconds}ms");
                                 // Even though pumping timed out, if IsPlayPhase is true now, we're OK
                                 if (CombatManager.Instance.IsPlayPhase) resolved = true;
                                 break;
                             }
-                            if (i % 10 == 9) Thread.Sleep(1);
+                            // Check hard timeout
+                            if (hardTimer.ElapsedMilliseconds > HARD_TIMEOUT_MS)
+                            {
+                                Log($"DoEndTurn HARD TIMEOUT after {hardTimer.ElapsedMilliseconds}ms in ForceStart pump loop");
+                                break;
+                            }
+                            Thread.Sleep(0);
                         }
 
-                        if (resolved)
+                        if (!resolved && hardTimer.ElapsedMilliseconds > HARD_TIMEOUT_MS - 1000)
+                        {
+                            // Hard timeout imminent — kill player to unblock
+                            Log($"DoEndTurn: ForceStart didn't resolve and hard timeout imminent. Killing player.");
+                            ForceKillPlayer(player);
+                            resolved = true;
+                        }
+                        else if (resolved)
                             Log("Force-StartTurn succeeded");
                         else
                             Log("Force-StartTurn did not resolve");
@@ -971,6 +1076,7 @@ public class RunSimulator
             YieldPatches.SuppressYield = false;
         }
 
+        Log($"DoEndTurn completed in {hardTimer.ElapsedMilliseconds}ms");
         return DetectDecisionPoint();
     }
 
@@ -2709,6 +2815,43 @@ public class RunSimulator
     /// AfterAllPlayersReadyToEndTurn). Uses reflection to call CombatManager.StartTurn
     /// directly, bypassing the broken async chain.
     /// </summary>
+
+    /// <summary>
+    /// Force-kill the player to end an unrecoverable combat. Used as a last resort
+    /// when all timeout and recovery mechanisms have failed.
+    /// </summary>
+    private void ForceKillPlayer(Player player)
+    {
+        try
+        {
+            var creature = player.Creature;
+            if (creature == null || creature.IsDead)
+            {
+                Log("ForceKillPlayer: creature already dead or null");
+                return;
+            }
+            // CurrentHp is read-only — set via reflection
+            var hpProp = creature.GetType().GetProperty("CurrentHp", BindingFlags.Public | BindingFlags.Instance);
+            if (hpProp != null && hpProp.CanWrite)
+            {
+                hpProp.SetValue(creature, 0);
+            }
+            else
+            {
+                // Try backing field
+                var hpField = creature.GetType().GetField("_currentHp", BindingFlags.NonPublic | BindingFlags.Instance)
+                           ?? creature.GetType().GetField("<CurrentHp>k__BackingField", BindingFlags.NonPublic | BindingFlags.Instance);
+                hpField?.SetValue(creature, 0);
+            }
+            _syncCtx.Pump();
+            Log("ForceKillPlayer: player HP set to 0");
+        }
+        catch (Exception ex)
+        {
+            Log($"ForceKillPlayer failed: {ex.Message}");
+        }
+    }
+
     private void ForceStartNextTurn(Player player)
     {
         var cm = CombatManager.Instance;
@@ -2778,19 +2921,19 @@ public class RunSimulator
             if (task != null)
             {
                 _syncCtx.Pump();
-                // Pump until task completes or play phase resumes (wall-clock timeout 5s)
+                // Pump until task completes or play phase resumes (wall-clock timeout 3s)
                 var startTurnTimer = Stopwatch.StartNew();
-                for (int i = 0; i < 500; i++)
+                for (int i = 0; i < 2000; i++)
                 {
                     _syncCtx.Pump();
                     if (task.IsCompleted) break;
                     if (CombatManager.Instance.IsPlayPhase) break;
-                    if (startTurnTimer.ElapsedMilliseconds > 5_000)
+                    if (startTurnTimer.ElapsedMilliseconds > 3_000)
                     {
                         Log($"ForceStartNextTurn: StartTurn pump timed out after {startTurnTimer.ElapsedMilliseconds}ms");
                         break;
                     }
-                    Thread.Sleep(1);
+                    Thread.Sleep(0);
                 }
             }
         }
@@ -2862,7 +3005,7 @@ public class RunSimulator
         }
     }
 
-    private void WaitForActionExecutor(int timeoutMs = 5000)
+    private void WaitForActionExecutor(int timeoutMs = 2000)
     {
         try
         {
@@ -2875,10 +3018,11 @@ public class RunSimulator
             var executor = RunManager.Instance.ActionExecutor;
             if (executor.IsRunning)
             {
-                // Pump while waiting for executor (with wall-clock timeout)
-                int maxPumps = 1000;
+                // Pump while waiting for executor (with wall-clock timeout).
+                // Use Thread.Sleep(0) instead of Sleep(1) to avoid 15ms sleep penalty
+                // on Windows/macOS while still yielding the timeslice.
                 var timer = Stopwatch.StartNew();
-                for (int i = 0; i < maxPumps; i++)
+                for (int i = 0; i < 5000; i++)
                 {
                     _syncCtx.Pump();
                     if (!executor.IsRunning) break;
@@ -2888,7 +3032,7 @@ public class RunSimulator
                         Log($"WaitForActionExecutor timed out after {timer.ElapsedMilliseconds}ms");
                         break;
                     }
-                    Thread.Sleep(1);
+                    Thread.Sleep(0);
                 }
             }
         }
