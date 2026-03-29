@@ -2113,7 +2113,7 @@ public class RunSimulator
         {
             var stats = new Dictionary<string, object?>();
             try { foreach (var dv in c.DynamicVars.Values) stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
-            return new Dictionary<string, object?>
+            var cardInfo = new Dictionary<string, object?>
             {
                 ["index"] = i,
                 ["id"] = c.Id.ToString(),
@@ -2124,6 +2124,7 @@ public class RunSimulator
                 ["description"] = _loc.Bilingual("cards", c.Id.Entry + ".description"),
                 ["stats"] = stats.Count > 0 ? stats : null,
                 ["after_upgrade"] = GetUpgradedInfo(c),
+                ["upgraded"] = c.IsUpgraded,
             };
             // Include star cost for Regent cards
             try { if (c.BaseStarCost > 0) cardInfo["star_cost"] = c.BaseStarCost; } catch { }
