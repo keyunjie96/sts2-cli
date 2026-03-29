@@ -175,7 +175,7 @@ internal class LocLookup
     public string? Zh(string table, string key) => _zhs.GetValueOrDefault(table)?.GetValueOrDefault(key);
 
     /// <summary>Strip BBCode tags like [gold], [/blue], [b], [sine], etc.</summary>
-    private static string StripBBCode(string text)
+    internal static string StripBBCode(string text)
     {
         return System.Text.RegularExpressions.Regex.Replace(text, @"\[/?[a-zA-Z_][a-zA-Z0-9_=]*\]", "");
     }
@@ -2144,25 +2144,76 @@ public class RunSimulator
             return MapSelectState();
         }
 
+        // Build resolved vars from the event's DynamicVars.
+        // StringVar instances (entity references like Enchantment, Rarity, Potion, Type)
+        // use their StringValue; numeric vars use IntValue.
+        var resolvedEventVars = new Dictionary<string, object?>();
+        try
+        {
+            if (localEvent.DynamicVars?.Values != null)
+            {
+                foreach (var dv in localEvent.DynamicVars.Values)
+                    resolvedEventVars[dv.Name] = ResolveDynamicVar(dv);
+            }
+        }
+        catch { }
+
+        // Also collect resolved vars from LocString.Variables on option LocStrings
+        // (the game populates these with fully-resolved entity names)
+        void MergeLocStringVars(LocString? ls)
+        {
+            try
+            {
+                if (ls?.Variables == null) return;
+                foreach (var kv in ls.Variables)
+                {
+                    if (kv.Value is string strVal)
+                        resolvedEventVars[kv.Key] = strVal;
+                    else if (kv.Value is LocString locVal)
+                    {
+                        try { resolvedEventVars[kv.Key] = StripBBCode(locVal.GetFormattedText()); }
+                        catch { resolvedEventVars[kv.Key] = locVal.LocEntryKey; }
+                    }
+                    else if (kv.Value is DynamicVar dynVal)
+                        resolvedEventVars[kv.Key] = ResolveDynamicVar(dynVal);
+                }
+            }
+            catch { }
+        }
+
         var options = currentOptions
             .Select((opt, i) =>
             {
-                // Try to resolve title via loc tables
+                // Merge vars from option Title and Description LocStrings
+                MergeLocStringVars(opt.Title);
+                MergeLocStringVars(opt.Description);
+
+                // Try GetFormattedText() first (game's SmartFormat with resolved vars)
                 string? title = null;
-                if (opt.Title != null)
+                try
+                {
+                    if (opt.Title != null)
+                    {
+                        var fmt = opt.Title.GetFormattedText();
+                        if (!string.IsNullOrEmpty(fmt) && fmt != opt.Title.LocEntryKey)
+                            title = StripBBCode(fmt);
+                    }
+                }
+                catch { }
+
+                // Fallback: manual loc table lookup + variable substitution
+                if (title == null && opt.Title != null)
                 {
                     var t = _loc.Bilingual(opt.Title.LocTable, opt.Title.LocEntryKey);
-                    // Check if we actually found a translation (not just the key echoed back)
                     if (t != opt.Title.LocEntryKey)
-                        title = t;
+                        title = SubstituteVars(t, resolvedEventVars);
                 }
                 // Fallback: try to extract option ID from the key and look up as relic/card/potion
                 if (title == null && opt.TextKey != null)
                 {
-                    // TextKey like "NEOW.pages.INITIAL.options.STONE_HUMIDIFIER" → extract "STONE_HUMIDIFIER"
+                    // TextKey like "NEOW.pages.INITIAL.options.STONE_HUMIDIFIER" -> extract "STONE_HUMIDIFIER"
                     var parts = opt.TextKey.Split('.');
                     var optionId = parts.Length > 0 ? parts[^1] : opt.TextKey;
-                    // Try relic, then card, then just use the optionId
                     var relic = _loc.Relic(optionId);
                     if (relic != optionId + ".title")
                         title = relic;
@@ -2177,13 +2228,25 @@ public class RunSimulator
                 }
                 title ??= $"option_{i}";
 
-                // Description: try loc table first
+                // Description: try GetFormattedText() first
                 string? optDesc = null;
-                if (opt.Description != null && !string.IsNullOrEmpty(opt.Description.LocEntryKey))
+                try
+                {
+                    if (opt.Description != null && !string.IsNullOrEmpty(opt.Description.LocEntryKey))
+                    {
+                        var fmt = opt.Description.GetFormattedText();
+                        if (!string.IsNullOrEmpty(fmt) && fmt != opt.Description.LocEntryKey)
+                            optDesc = StripBBCode(fmt);
+                    }
+                }
+                catch { }
+
+                // Fallback: manual loc table lookup + variable substitution
+                if (optDesc == null && opt.Description != null && !string.IsNullOrEmpty(opt.Description.LocEntryKey))
                 {
                     var d = _loc.Bilingual(opt.Description.LocTable, opt.Description.LocEntryKey);
                     if (d != opt.Description.LocEntryKey)
-                        optDesc = d;
+                        optDesc = SubstituteVars(d, resolvedEventVars);
                 }
                 // Fallback: try relic/card description
                 if (optDesc == null && opt.TextKey != null)
@@ -2195,19 +2258,10 @@ public class RunSimulator
                         optDesc = rd;
                 }
 
-                // Extract vars: try event's own DynamicVars first, then relic
-                Dictionary<string, object?>? optVars = null;
-                try
-                {
-                    // Event's DynamicVars (covers Gold, HpLoss, Heal, etc.)
-                    if (localEvent.DynamicVars?.Values != null)
-                    {
-                        optVars = new Dictionary<string, object?>();
-                        foreach (var dv in localEvent.DynamicVars.Values)
-                            optVars[dv.Name] = (int)dv.BaseValue;
-                    }
-                }
-                catch { }
+                // Build vars for JSON output (resolved names, not raw IDs)
+                Dictionary<string, object?>? optVars = resolvedEventVars.Count > 0
+                    ? new Dictionary<string, object?>(resolvedEventVars) : null;
+
                 // Also try relic vars (for Neow options)
                 if (opt.TextKey != null)
                 {
@@ -2221,7 +2275,7 @@ public class RunSimulator
                             optVars ??= new Dictionary<string, object?>();
                             var mutable = relicModel.ToMutable();
                             foreach (var dv in mutable.DynamicVars.Values)
-                                optVars[dv.Name] = (int)dv.BaseValue;
+                                optVars[dv.Name] = ResolveDynamicVar(dv);
                         }
                     }
                     catch { }
@@ -2244,13 +2298,24 @@ public class RunSimulator
         if (eventName == eventEntry + ".title")
             eventName = _loc.Event(eventEntry);
 
-        // Resolve event description, suppress if key not found
+        // Resolve event description: try GetFormattedText() first, then manual lookup
         string? eventDesc = null;
         if (localEvent.Description != null)
         {
-            var d = _loc.Bilingual(localEvent.Description.LocTable, localEvent.Description.LocEntryKey);
-            if (d != localEvent.Description.LocEntryKey)
-                eventDesc = d;
+            try
+            {
+                MergeLocStringVars(localEvent.Description);
+                var fmt = localEvent.Description.GetFormattedText();
+                if (!string.IsNullOrEmpty(fmt) && fmt != localEvent.Description.LocEntryKey)
+                    eventDesc = StripBBCode(fmt);
+            }
+            catch { }
+            if (eventDesc == null)
+            {
+                var d = _loc.Bilingual(localEvent.Description.LocTable, localEvent.Description.LocEntryKey);
+                if (d != localEvent.Description.LocEntryKey)
+                    eventDesc = SubstituteVars(d, resolvedEventVars);
+            }
         }
 
         return new Dictionary<string, object?>
@@ -2264,6 +2329,47 @@ public class RunSimulator
             ["player"] = PlayerSummary(_runState!.Players[0]),
         };
     }
+
+    /// <summary>
+    /// Resolve a DynamicVar to a display-friendly value.
+    /// StringVar instances (entity references like Enchantment, Rarity, Potion, Type)
+    /// return their StringValue. Numeric vars return IntValue.
+    /// </summary>
+    private static object? ResolveDynamicVar(DynamicVar dv)
+    {
+        if (dv is StringVar sv && sv.StringValue != null)
+            return sv.StringValue;
+        // Try ToString() which may return a resolved entity name
+        try
+        {
+            var s = dv.ToString();
+            if (!string.IsNullOrEmpty(s) && s != "0"
+                && s != dv.BaseValue.ToString(System.Globalization.CultureInfo.InvariantCulture))
+                return s;
+        }
+        catch { }
+        return dv.IntValue;
+    }
+
+    /// <summary>
+    /// Simple template variable substitution: replaces {VarName} placeholders
+    /// in a localization string with resolved values. Also handles SmartFormat
+    /// extensions like {Var:plural:...} by stripping the format suffix.
+    /// </summary>
+    private static string SubstituteVars(string template, Dictionary<string, object?> vars)
+    {
+        if (vars.Count == 0 || !template.Contains('{'))
+            return template;
+        return System.Text.RegularExpressions.Regex.Replace(template, @"\{(\w+)(?::[^}]*)?\}", m =>
+        {
+            var key = m.Groups[1].Value;
+            if (vars.TryGetValue(key, out var val) && val != null)
+                return val.ToString() ?? m.Value;
+            return m.Value;
+        });
+    }
+
+    private static string StripBBCode(string text) => LocLookup.StripBBCode(text);
 
     private Dictionary<string, object?> RestSiteState(RestSiteRoom restRoom)
     {
