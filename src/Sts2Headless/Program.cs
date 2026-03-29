@@ -28,7 +28,9 @@ class Program
         };
 
         // Set up assembly resolution to find game DLLs
-        var libDir = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "lib");
+        var libDir = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "lib");
+        if (!Directory.Exists(libDir))
+            libDir = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "lib");
         if (!Directory.Exists(libDir))
             libDir = Path.Combine(AppContext.BaseDirectory, "lib");
 
