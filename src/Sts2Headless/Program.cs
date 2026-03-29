@@ -14,20 +14,62 @@ class Program
         WriteIndented = false,
     };
 
-    static void Main(string[] args)
+    /// <summary>Track whether stdout is still writable (pipe not broken).</summary>
+    private static volatile bool _stdoutAlive = true;
+
+    static int Main(string[] args)
     {
-        // Prevent unhandled exceptions from crashing the process
+        // ── Global crash prevention ──────────────────────────────────────
+        // AppDomain.UnhandledException fires *after* the runtime decides to
+        // terminate, so we can only log — but at least we leave a trace.
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
         {
-            Console.Error.WriteLine($"[FATAL] Unhandled: {e.ExceptionObject}");
+            try
+            {
+                Console.Error.WriteLine($"[FATAL] Unhandled: {e.ExceptionObject}");
+                Console.Error.Flush();
+            }
+            catch { /* stderr itself may be broken */ }
         };
+
+        // Catch fire-and-forget Task exceptions so the finalizer thread
+        // doesn't re-raise them and crash the process.
         TaskScheduler.UnobservedTaskException += (_, e) =>
         {
-            Console.Error.WriteLine($"[WARN] Unobserved task exception: {e.Exception?.Message}");
+            try
+            {
+                Console.Error.WriteLine($"[WARN] Unobserved task exception: {e.Exception}");
+                Console.Error.Flush();
+            }
+            catch { }
             e.SetObserved();
         };
 
-        // Set up assembly resolution to find game DLLs
+        // Graceful shutdown on Ctrl+C / SIGINT — log before exit.
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = false; // let the process terminate
+            try
+            {
+                Console.Error.WriteLine("[INFO] Received SIGINT (Ctrl+C), shutting down");
+                Console.Error.Flush();
+            }
+            catch { }
+        };
+
+        // SIGTERM handler (exit code 143 = 128+15) — .NET exposes this via
+        // ProcessExit on non-Windows platforms.
+        AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+        {
+            try
+            {
+                Console.Error.WriteLine("[INFO] ProcessExit event fired, shutting down");
+                Console.Error.Flush();
+            }
+            catch { }
+        };
+
+        // ── Assembly resolution ──────────────────────────────────────────
         var libDir = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "lib");
         if (!Directory.Exists(libDir))
             libDir = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "lib");
@@ -40,7 +82,6 @@ class Program
             if (File.Exists(path))
                 return ctx.LoadFromAssemblyPath(Path.GetFullPath(path));
 
-            // Also check game directory (via STS2_GAME_DIR env var)
             var gameDir = Environment.GetEnvironmentVariable("STS2_GAME_DIR") ?? "";
             if (!string.IsNullOrEmpty(gameDir))
             {
@@ -52,33 +93,114 @@ class Program
             return null;
         };
 
-        var sim = new RunSimulator();
-        WriteLine(new Dictionary<string, object?> { ["type"] = "ready", ["version"] = "0.2.0" });
-
-        string? line;
-        while ((line = Console.ReadLine()) != null)
+        // ── Main loop ────────────────────────────────────────────────────
+        RunSimulator? sim = null;
+        try
         {
-            line = line.Trim();
-            if (string.IsNullOrEmpty(line)) continue;
+            sim = new RunSimulator();
+            WriteLine(new Dictionary<string, object?> { ["type"] = "ready", ["version"] = "0.2.0" });
 
-            Dictionary<string, object?>? result;
+            string? line;
+            while (true)
+            {
+                try
+                {
+                    line = Console.ReadLine();
+                }
+                catch (IOException ex)
+                {
+                    // Stdin pipe broken (parent process died)
+                    Console.Error.WriteLine($"[INFO] Stdin read failed (pipe broken): {ex.Message}");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[WARN] Stdin read error: {ex.GetType().Name}: {ex.Message}");
+                    break;
+                }
+
+                if (line == null)
+                {
+                    // EOF on stdin — parent process closed the pipe
+                    Console.Error.WriteLine("[INFO] Stdin EOF, exiting");
+                    break;
+                }
+
+                line = line.Trim();
+                if (string.IsNullOrEmpty(line)) continue;
+
+                Dictionary<string, object?>? result;
+                try
+                {
+                    var cmd = JsonSerializer.Deserialize<JsonElement>(line);
+                    result = HandleCommand(sim, cmd);
+                }
+                catch (JsonException ex)
+                {
+                    result = new Dictionary<string, object?> { ["type"] = "error", ["message"] = $"Invalid JSON: {ex.Message}" };
+                }
+                catch (OutOfMemoryException)
+                {
+                    // OOM — log and exit immediately, don't try to allocate more
+                    Console.Error.WriteLine("[FATAL] OutOfMemoryException processing command");
+                    return 1;
+                }
+                catch (StackOverflowException)
+                {
+                    // This is normally uncatchable, but just in case the runtime
+                    // routes it through managed code on some paths:
+                    Console.Error.WriteLine("[FATAL] StackOverflowException processing command");
+                    return 1;
+                }
+                catch (Exception ex)
+                {
+                    result = new Dictionary<string, object?> { ["type"] = "error", ["message"] = $"{ex.GetType().Name}: {ex.Message}" };
+                    Console.Error.WriteLine($"[WARN] Command exception: {ex.GetType().Name}: {ex.Message}");
+                }
+
+                if (result != null)
+                {
+                    if (!TryWriteLine(result))
+                    {
+                        Console.Error.WriteLine("[INFO] Stdout write failed, exiting");
+                        break;
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // Catch-all for anything that escapes the main loop
             try
             {
-                var cmd = JsonSerializer.Deserialize<JsonElement>(line);
-                result = HandleCommand(sim, cmd);
+                Console.Error.WriteLine($"[FATAL] Main loop crashed: {ex.GetType().Name}: {ex.Message}");
+                Console.Error.WriteLine(ex.StackTrace);
+                Console.Error.Flush();
             }
-            catch (JsonException ex)
+            catch { }
+            return 1;
+        }
+        finally
+        {
+            // Always clean up the simulator before exiting
+            try
             {
-                result = new Dictionary<string, object?> { ["type"] = "error", ["message"] = $"Invalid JSON: {ex.Message}" };
+                sim?.CleanUp();
             }
             catch (Exception ex)
             {
-                result = new Dictionary<string, object?> { ["type"] = "error", ["message"] = $"{ex.GetType().Name}: {ex.Message}" };
+                try { Console.Error.WriteLine($"[WARN] CleanUp on exit: {ex.Message}"); } catch { }
             }
 
-            if (result != null)
-                WriteLine(result);
+            try
+            {
+                Console.Error.WriteLine("[INFO] Process exiting normally");
+                Console.Error.Flush();
+            }
+            catch { }
         }
+
+        return 0;
     }
 
     static Dictionary<string, object?>? HandleCommand(RunSimulator sim, JsonElement cmd)
@@ -153,9 +275,31 @@ class Program
         }
     }
 
+    /// <summary>Write a JSON line to stdout. Returns false if the pipe is broken.</summary>
+    static bool TryWriteLine(Dictionary<string, object?> data)
+    {
+        if (!_stdoutAlive) return false;
+        try
+        {
+            Console.Out.WriteLine(JsonSerializer.Serialize(data, JsonOpts));
+            Console.Out.Flush();
+            return true;
+        }
+        catch (IOException)
+        {
+            _stdoutAlive = false;
+            return false;
+        }
+        catch (ObjectDisposedException)
+        {
+            _stdoutAlive = false;
+            return false;
+        }
+    }
+
+    /// <summary>Backward-compatible Write for code that doesn't check the return value.</summary>
     static void WriteLine(Dictionary<string, object?> data)
     {
-        Console.Out.WriteLine(JsonSerializer.Serialize(data, JsonOpts));
-        Console.Out.Flush();
+        TryWriteLine(data);
     }
 }

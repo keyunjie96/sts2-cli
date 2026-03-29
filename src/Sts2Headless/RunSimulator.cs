@@ -42,6 +42,12 @@ internal class InlineSynchronizationContext : SynchronizationContext
     private readonly Queue<(SendOrPostCallback, object?)> _queue = new();
     private bool _executing;
 
+    /// <summary>
+    /// Safety limit: if the queue grows beyond this during a single drain cycle,
+    /// stop draining to prevent unbounded memory growth / pseudo-stack-overflow.
+    /// </summary>
+    private const int MaxDrainPerCycle = 10_000;
+
     public override void Post(SendOrPostCallback d, object? state)
     {
         if (_executing)
@@ -49,7 +55,6 @@ internal class InlineSynchronizationContext : SynchronizationContext
             _queue.Enqueue((d, state));
             return;
         }
-        // removed debug log
 
         // Execute inline immediately, then drain any nested posts
         _executing = true;
@@ -57,11 +62,29 @@ internal class InlineSynchronizationContext : SynchronizationContext
         {
             d(state);
             // Drain any callbacks that were queued during execution
-            while (_queue.Count > 0)
+            int drained = 0;
+            while (_queue.Count > 0 && drained < MaxDrainPerCycle)
             {
                 var (cb, st) = _queue.Dequeue();
-                cb(st);
+                try
+                {
+                    cb(st);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[WARN] SyncCtx.Post drain callback threw: {ex.GetType().Name}: {ex.Message}");
+                }
+                drained++;
             }
+            if (_queue.Count > 0)
+                Console.Error.WriteLine($"[WARN] SyncCtx.Post drain hit limit ({MaxDrainPerCycle}), {_queue.Count} callbacks remaining");
+        }
+        catch (Exception ex)
+        {
+            // The initial d(state) call threw — log but don't crash the process.
+            // The caller (an async continuation) posted to this context and expects
+            // errors to be captured by the Task machinery, not to crash the host.
+            Console.Error.WriteLine($"[WARN] SyncCtx.Post callback threw: {ex.GetType().Name}: {ex.Message}");
         }
         finally
         {
@@ -71,19 +94,40 @@ internal class InlineSynchronizationContext : SynchronizationContext
 
     public override void Send(SendOrPostCallback d, object? state)
     {
-        d(state);
+        try
+        {
+            d(state);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] SyncCtx.Send callback threw: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     public void Pump()
     {
         // Drain any remaining queued callbacks
-        while (_queue.Count > 0)
+        int drained = 0;
+        while (_queue.Count > 0 && drained < MaxDrainPerCycle)
         {
             var (cb, st) = _queue.Dequeue();
             _executing = true;
-            try { cb(st); }
-            finally { _executing = false; }
+            try
+            {
+                cb(st);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[WARN] SyncCtx.Pump callback threw: {ex.GetType().Name}: {ex.Message}");
+            }
+            finally
+            {
+                _executing = false;
+            }
+            drained++;
         }
+        if (_queue.Count > 0)
+            Console.Error.WriteLine($"[WARN] SyncCtx.Pump hit limit ({MaxDrainPerCycle}), {_queue.Count} callbacks remaining");
     }
 }
 
@@ -546,6 +590,7 @@ public class RunSimulator
         Log($"Moving to map coord ({col},{row})");
 
         // BUG-013: Wait for any pending actions (relic sessions, etc.) to complete before entering new room
+        WaitForRelicPickingComplete();
         WaitForActionExecutor();
         _syncCtx.Pump();
 
@@ -1681,13 +1726,14 @@ public class RunSimulator
         if (player.Creature != null && player.Creature.CurrentHp > 0)
             _lastKnownHp = player.Creature.CurrentHp;
 
-        var hand = pcs?.Hand?.Cards?.Select((c, i) =>
+        // Snapshot hand cards to avoid "Collection was modified" during enumeration
+        var hand = pcs?.Hand?.Cards?.ToList().Select((c, i) =>
         {
             // Extract actual stat values from DynamicVars
             var stats = new Dictionary<string, object?>();
             try
             {
-                foreach (var dv in c.DynamicVars.Values)
+                foreach (var dv in c.DynamicVars.Values.ToList())
                 {
                     stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue;
                 }
@@ -1731,7 +1777,8 @@ public class RunSimulator
 
         var playerCreatures = combatState?.PlayerCreatures?.ToList();
 
-        var enemies = combatState?.Enemies?
+        // Snapshot enemies to avoid "Collection was modified" during enumeration
+        var enemies = combatState?.Enemies?.ToList()
             .Where(e => e != null && e.IsAlive)
             .Select((e, i) =>
             {
@@ -1741,7 +1788,7 @@ public class RunSimulator
                 {
                     if (e.Monster?.NextMove?.Intents != null)
                     {
-                        foreach (var intent in e.Monster.NextMove.Intents)
+                        foreach (var intent in e.Monster.NextMove.Intents.ToList())
                         {
                             var intentInfo = new Dictionary<string, object?>
                             {
@@ -2255,33 +2302,52 @@ public class RunSimulator
         // Treasure rooms give relics via TreasureRoomRelicSynchronizer
         Log("Treasure room — collecting rewards");
 
-        // BUG-013: Ensure any pending relic picking session is complete before starting new one
+        // BUG-013: Ensure any pending relic picking session is complete before starting new one.
+        // First, use reflection to actively wait for _isInSharedRelicPicking to clear.
+        // Then pump and wait for action executor. This two-phase wait is much more reliable
+        // than the previous single WaitForActionExecutor call.
+        WaitForRelicPickingComplete();
         WaitForActionExecutor();
         _syncCtx.Pump();
 
-        try
+        // Retry up to 3 times with increasing delays if relic picking session conflicts
+        const int maxRetries = 3;
+        for (int attempt = 0; attempt <= maxRetries; attempt++)
         {
-            treasureRoom.DoNormalRewards().GetAwaiter().GetResult();
-            _syncCtx.Pump();
-            treasureRoom.DoExtraRewardsIfNeeded().GetAwaiter().GetResult();
-            _syncCtx.Pump();
-        }
-        catch (InvalidOperationException ex) when (ex.Message.Contains("relic picking session"))
-        {
-            // BUG-013: Relic session conflict — wait for pending session then retry
-            Log($"Relic session conflict, waiting and retrying: {ex.Message}");
-            WaitForActionExecutor();
-            _syncCtx.Pump();
             try
             {
+                if (attempt > 0)
+                {
+                    Log($"Treasure rewards retry attempt {attempt}/{maxRetries}");
+                    // Wait with increasing delay before retry
+                    Thread.Sleep(attempt * 200);
+                    WaitForRelicPickingComplete();
+                    WaitForActionExecutor();
+                    _syncCtx.Pump();
+                }
+
                 treasureRoom.DoNormalRewards().GetAwaiter().GetResult();
                 _syncCtx.Pump();
                 treasureRoom.DoExtraRewardsIfNeeded().GetAwaiter().GetResult();
                 _syncCtx.Pump();
+                break; // Success — exit retry loop
             }
-            catch (Exception retryEx) { Log($"Treasure rewards retry failed: {retryEx.Message}"); }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("relic picking session"))
+            {
+                // BUG-013: Relic session conflict — wait for pending session then retry
+                Log($"Relic session conflict (attempt {attempt}): {ex.Message}");
+                if (attempt >= maxRetries)
+                {
+                    Log("Treasure rewards: all retries exhausted, force-clearing relic state and skipping rewards");
+                    ForceResetRelicPickingState();
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Treasure rewards: {ex.Message}");
+                break; // Non-relic-session errors are not retryable
+            }
         }
-        catch (Exception ex) { Log($"Treasure rewards: {ex.Message}"); }
 
         ForceToMap();
         return MapSelectState();
@@ -2504,6 +2570,108 @@ public class RunSimulator
         }
     }
 
+    /// <summary>
+    /// Wait for any active relic picking session to complete before starting a new one.
+    /// Uses reflection to check the _isInSharedRelicPicking flag on RunManager or its
+    /// TreasureRoomRelicSynchronizer. This prevents the
+    /// "Attempted to start new relic picking session while one was already occurring!"
+    /// InvalidOperationException that crashes treasure rooms.
+    /// </summary>
+    private void WaitForRelicPickingComplete(int timeoutMs = 8000)
+    {
+        try
+        {
+            // Try to find the _isInSharedRelicPicking field via reflection
+            var runMgr = RunManager.Instance;
+            FieldInfo? pickingField = null;
+            object? fieldOwner = null;
+
+            // Check RunManager itself
+            pickingField = runMgr.GetType().GetField("_isInSharedRelicPicking",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            if (pickingField != null)
+            {
+                fieldOwner = runMgr;
+            }
+            else
+            {
+                // Check TreasureRoomRelicSynchronizer property
+                var syncProp = runMgr.GetType().GetProperty("TreasureRoomRelicSynchronizer",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var synchronizer = syncProp?.GetValue(runMgr);
+                if (synchronizer != null)
+                {
+                    pickingField = synchronizer.GetType().GetField("_isInSharedRelicPicking",
+                        BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (pickingField != null) fieldOwner = synchronizer;
+                }
+            }
+
+            // Also look for _relicPickingTaskCompletionSource to check if a task is pending
+            FieldInfo? tcsField = null;
+            object? tcsOwner = null;
+            tcsField = runMgr.GetType().GetField("_relicPickingTaskCompletionSource",
+                BindingFlags.NonPublic | BindingFlags.Instance);
+            if (tcsField != null) tcsOwner = runMgr;
+
+            if (pickingField == null && tcsField == null)
+            {
+                // Can't introspect — fall back to just pumping
+                WaitForActionExecutor(timeoutMs);
+                return;
+            }
+
+            var timer = Stopwatch.StartNew();
+            while (timer.ElapsedMilliseconds < timeoutMs)
+            {
+                _syncCtx.Pump();
+
+                bool isPicking = false;
+
+                // Check the boolean flag
+                if (pickingField != null && fieldOwner != null)
+                {
+                    try { isPicking = (bool)(pickingField.GetValue(fieldOwner) ?? false); }
+                    catch { }
+                }
+
+                // Also check if TCS is non-null and not completed
+                if (!isPicking && tcsField != null && tcsOwner != null)
+                {
+                    try
+                    {
+                        var tcs = tcsField.GetValue(tcsOwner);
+                        if (tcs != null)
+                        {
+                            // TaskCompletionSource<T>.Task.IsCompleted
+                            var taskProp = tcs.GetType().GetProperty("Task");
+                            var task = taskProp?.GetValue(tcs) as Task;
+                            if (task != null && !task.IsCompleted)
+                                isPicking = true;
+                        }
+                    }
+                    catch { }
+                }
+
+                if (!isPicking)
+                {
+                    // Relic picking is done (or was never active)
+                    return;
+                }
+
+                // Still picking — pump and wait
+                WaitForActionExecutor(500);
+                Thread.Sleep(10);
+            }
+
+            Log($"WaitForRelicPickingComplete timed out after {timer.ElapsedMilliseconds}ms — proceeding anyway");
+        }
+        catch (Exception ex)
+        {
+            Log($"WaitForRelicPickingComplete exception: {ex.Message}");
+        }
+    }
+
     private void SpinWaitForCombatStable()
     {
         int maxIterations = 200;
@@ -2565,10 +2733,12 @@ public class RunSimulator
             ["max_hp"] = player.Creature?.MaxHp ?? 0,
             ["block"] = player.Creature?.Block ?? 0,
             ["gold"] = player.Gold,
-            ["relics"] = player.Relics?.Select(r =>
+            // Snapshot collections with .ToList() before iterating to avoid
+            // "Collection was modified; enumeration operation may not execute" from concurrent modification
+            ["relics"] = player.Relics?.ToList().Select(r =>
             {
                 var vars = new Dictionary<string, object?>();
-                try { foreach (var dv in r.DynamicVars.Values) vars[dv.Name] = (int)dv.BaseValue; } catch { }
+                try { foreach (var dv in r.DynamicVars.Values.ToList()) vars[dv.Name] = (int)dv.BaseValue; } catch { }
                 return new Dictionary<string, object?>
                 {
                     ["name"] = _loc.Relic(r.Id.Entry),
@@ -2576,11 +2746,11 @@ public class RunSimulator
                     ["vars"] = vars.Count > 0 ? vars : null,
                 };
             }).ToList(),
-            ["potions"] = player.Potions?.Select((p, i) =>
+            ["potions"] = player.Potions?.ToList().Select((p, i) =>
             {
                 if (p == null) return null;
                 var pvars = new Dictionary<string, object?>();
-                try { foreach (var dv in p.DynamicVars.Values) pvars[dv.Name] = (int)dv.BaseValue; } catch { }
+                try { foreach (var dv in p.DynamicVars.Values.ToList()) pvars[dv.Name] = (int)dv.BaseValue; } catch { }
                 return new Dictionary<string, object?>
                 {
                     ["index"] = i,
@@ -2591,10 +2761,10 @@ public class RunSimulator
                 };
             }).Where(x => x != null).ToList(),
             ["deck_size"] = player.Deck?.Cards?.Count(c => c != null) ?? 0,
-            ["deck"] = player.Deck?.Cards?.Where(c => c != null).Select(c =>
+            ["deck"] = player.Deck?.Cards?.ToList().Where(c => c != null).Select(c =>
             {
                 var dstats = new Dictionary<string, object?>();
-                try { foreach (var dv in c.DynamicVars.Values) dstats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
+                try { foreach (var dv in c.DynamicVars.Values.ToList()) dstats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
                 var dkws = c.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToList();
                 return new Dictionary<string, object?>
                 {
