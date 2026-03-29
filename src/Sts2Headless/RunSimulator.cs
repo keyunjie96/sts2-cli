@@ -528,16 +528,13 @@ public class RunSimulator
 
             var player = _runState.Players[0];
 
-            // God mode: restore HP to max before every action
+            // God mode: set HP to 9999 so burst damage can't kill
             if (GodMode && player.Creature != null)
             {
                 try
                 {
-                    var maxHp = player.Creature.MaxHp;
-                    if (player.Creature.CurrentHp < maxHp)
-                    {
-                        SetField(player.Creature, "_currentHp", maxHp);
-                    }
+                    SetField(player.Creature, "_currentHp", 9999);
+                    SetField(player.Creature, "_maxHp", 9999);
                 }
                 catch { }
             }
