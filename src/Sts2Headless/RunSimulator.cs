@@ -650,133 +650,99 @@ public class RunSimulator
         _combatEnded.Reset();
 
         // Enable SuppressYield so Task.Yield() runs inline during enemy turn processing.
-        // This prevents deadlocks during boss fights (e.g., Vantom) where continuations
-        // would otherwise be posted to ThreadPool and never complete.
+        // This prevents deadlocks where AfterAllPlayersReadyToBeginEnemyTurn starts with
+        // Task.Yield() — if SuppressYield is false, the continuation gets posted to the
+        // sync context but never drained, causing the turn to never advance.
+        //
+        // CRITICAL: SuppressYield must stay true throughout the entire turn transition,
+        // including the enemy turn and start-of-next-turn processing. It is only safe to
+        // disable once IsPlayPhase is true again (or combat ended / player died).
         YieldPatches.SuppressYield = true;
         try
         {
             PlayerCmd.EndTurn(player, canBackOut: false);
             _syncCtx.Pump();
+
+            // Pump aggressively until the turn transition completes.
+            // SuppressYield stays true the entire time so async continuations
+            // (Task.Yield in AfterAllPlayersReadyToBeginEnemyTurn, SwitchFromPlayerToEnemySide,
+            // StartTurn, etc.) all execute inline synchronously.
+            bool resolved = false;
+            int emptyPumps = 0;
+            for (int i = 0; i < 2000; i++)
+            {
+                _syncCtx.Pump();
+                if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) { resolved = true; break; }
+                if (_combatEnded.IsSet) { resolved = true; break; }
+                if (CombatManager.Instance.IsPlayPhase) { resolved = true; break; }
+
+                // Early exit: if the sync context queue is drained and the executor isn't
+                // running, the async chain has stalled (likely NRE). No point pumping further.
+                try
+                {
+                    if (!RunManager.Instance.ActionExecutor.IsRunning)
+                    {
+                        emptyPumps++;
+                        if (emptyPumps > 50) break;  // Give it 50 iterations to be safe
+                    }
+                    else
+                    {
+                        emptyPumps = 0;
+                    }
+                }
+                catch { }
+
+                if (i % 10 == 9) Thread.Sleep(1);
+            }
+
+            if (!resolved)
+            {
+                Log("EndTurn did not resolve after pumping — checking executor");
+                // Wait for the action executor to finish processing
+                WaitForActionExecutor();
+                _syncCtx.Pump();
+
+                // One more check
+                if (CombatManager.Instance.IsPlayPhase || !CombatManager.Instance.IsInProgress || player.Creature.IsDead)
+                    resolved = true;
+            }
+
+            if (!resolved)
+            {
+                Log($"EndTurn not resolved after pumping. IsPlayPhase={CombatManager.Instance.IsPlayPhase}, " +
+                    $"IsInProgress={CombatManager.Instance.IsInProgress}, ActionExecutor.IsRunning={RunManager.Instance.ActionExecutor.IsRunning}");
+
+                // The turn transition failed (likely NRE in async chain).
+                // Force-start the next turn by calling StartTurn directly via reflection.
+                try
+                {
+                    ForceStartNextTurn(player);
+                    _syncCtx.Pump();
+
+                    // Pump until play phase resumes
+                    for (int i = 0; i < 2000; i++)
+                    {
+                        _syncCtx.Pump();
+                        if (_turnStarted.IsSet || _combatEnded.IsSet) { resolved = true; break; }
+                        if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) { resolved = true; break; }
+                        if (CombatManager.Instance.IsPlayPhase) { resolved = true; break; }
+                        if (i % 10 == 9) Thread.Sleep(1);
+                    }
+
+                    if (resolved)
+                        Log("Force-StartTurn succeeded");
+                    else
+                        Log("Force-StartTurn did not resolve");
+                }
+                catch (Exception ex)
+                {
+                    Log($"Force-StartTurn failed: {ex.Message}");
+                }
+            }
         }
         finally
         {
             YieldPatches.SuppressYield = false;
-        }
-
-        // Fallback: if turn didn't complete synchronously, wait briefly then force retry
-        if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
-        {
-            for (int i = 0; i < 50; i++)
-            {
-                _syncCtx.Pump();
-                if (_turnStarted.IsSet || _combatEnded.IsSet) break;
-                if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                if (CombatManager.Instance.IsPlayPhase) break;
-                Thread.Sleep(5);
-            }
-
-            // If STILL stuck, the WaitUntilQueue TCS is likely deadlocked.
-            // Cancel the ActionExecutor to break out, then re-trigger EndTurn.
-            if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
-            {
-                Log("EndTurn stuck, cancelling and retrying with SuppressYield...");
-                try
-                {
-                    RunManager.Instance.ActionExecutor.Cancel();
-                    _syncCtx.Pump();
-                    Thread.Sleep(50);
-                    _syncCtx.Pump();
-
-                    // Reset the player ready state and try again with SuppressYield
-                    CombatManager.Instance.UndoReadyToEndTurn(player);
-                    _syncCtx.Pump();
-
-                    YieldPatches.SuppressYield = true;
-                    try
-                    {
-                        PlayerCmd.EndTurn(player, canBackOut: false);
-                        _syncCtx.Pump();
-                    }
-                    finally
-                    {
-                        YieldPatches.SuppressYield = false;
-                    }
-
-                    for (int i = 0; i < 100; i++)
-                    {
-                        _syncCtx.Pump();
-                        if (_turnStarted.IsSet || _combatEnded.IsSet) break;
-                        if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                        if (CombatManager.Instance.IsPlayPhase) break;
-                        Thread.Sleep(10);
-                    }
-                }
-                catch (Exception ex) { Log($"Cancel retry: {ex.Message}"); }
-            }
-
-            // NUCLEAR OPTION: If STILL stuck after 2 attempts, use ThreadPool to force
-            // the enemy turn processing to complete with SuppressYield permanently on.
-            if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
-            {
-                var stuckState = CombatManager.Instance.DebugOnlyGetState();
-                var stuckEnemies = stuckState?.Enemies?.Where(e => e != null && e.IsAlive)
-                    .Select(e => $"{e.Monster?.GetType().Name}(hp={e.CurrentHp})").ToList();
-                Log($"EndTurn STILL stuck after retry — nuclear fallback. Round={stuckState?.RoundNumber}, " +
-                    $"Enemies=[{string.Join(",", stuckEnemies ?? new())}], " +
-                    $"IsPlayPhase={CombatManager.Instance.IsPlayPhase}, " +
-                    $"IsInProgress={CombatManager.Instance.IsInProgress}, " +
-                    $"ActionExecutor.IsRunning={RunManager.Instance.ActionExecutor.IsRunning}");
-                try
-                {
-                    // Cancel again and undo
-                    RunManager.Instance.ActionExecutor.Cancel();
-                    _syncCtx.Pump();
-                    CombatManager.Instance.UndoReadyToEndTurn(player);
-                    _syncCtx.Pump();
-                    Thread.Sleep(50);
-
-                    // Run EndTurn on ThreadPool with SuppressYield permanently on
-                    YieldPatches.SuppressYield = true;
-                    var endTurnTask = Task.Run(() =>
-                    {
-                        PlayerCmd.EndTurn(player, canBackOut: false);
-                    });
-
-                    // Aggressively pump sync context while waiting (up to 5 seconds)
-                    for (int i = 0; i < 500; i++)
-                    {
-                        _syncCtx.Pump();
-                        if (endTurnTask.IsCompleted) break;
-                        if (_turnStarted.IsSet || _combatEnded.IsSet) break;
-                        if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                        if (CombatManager.Instance.IsPlayPhase) break;
-                        Thread.Sleep(10);
-                    }
-                    YieldPatches.SuppressYield = false;
-
-                    // If still not play phase, try just waiting a bit more
-                    if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
-                    {
-                        for (int i = 0; i < 200; i++)
-                        {
-                            _syncCtx.Pump();
-                            Thread.Sleep(10);
-                            if (CombatManager.Instance.IsPlayPhase || !CombatManager.Instance.IsInProgress || player.Creature.IsDead)
-                                break;
-                        }
-                    }
-
-                    if (CombatManager.Instance.IsPlayPhase)
-                        Log("Nuclear fallback SUCCEEDED — play phase resumed");
-                    else
-                        Log("Nuclear fallback FAILED — returning stuck state");
-                }
-                catch (Exception ex)
-                {
-                    Log($"Nuclear fallback error: {ex.Message}");
-                    YieldPatches.SuppressYield = false;
-                }
-            }
         }
 
         return DetectDecisionPoint();
@@ -2216,6 +2182,79 @@ public class RunSimulator
     #endregion
 
     #region Helpers
+
+    /// <summary>
+    /// Force-start the next turn when the normal EndTurn async chain fails (e.g., NRE in
+    /// AfterAllPlayersReadyToEndTurn). Uses reflection to call CombatManager.StartTurn
+    /// directly, bypassing the broken async chain.
+    /// </summary>
+    private void ForceStartNextTurn(Player player)
+    {
+        var cm = CombatManager.Instance;
+        var cmType = cm.GetType();
+
+        // Reset internal state that EndTurn partially modified
+        // Clear _playersReadyToEndTurn and _playersReadyToBeginEnemyTurn
+        var readyEndField = cmType.GetField("_playersReadyToEndTurn", BindingFlags.NonPublic | BindingFlags.Instance);
+        if (readyEndField?.GetValue(cm) is System.Collections.ICollection readyEnd)
+        {
+            var clearMethod = readyEnd.GetType().GetMethod("Clear");
+            clearMethod?.Invoke(readyEnd, null);
+        }
+
+        var readyBeginField = cmType.GetField("_playersReadyToBeginEnemyTurn", BindingFlags.NonPublic | BindingFlags.Instance);
+        if (readyBeginField?.GetValue(cm) is System.Collections.ICollection readyBegin)
+        {
+            var clearMethod = readyBegin.GetType().GetMethod("Clear");
+            clearMethod?.Invoke(readyBegin, null);
+        }
+
+        // Reset EndingPlayerTurnPhaseOne flag
+        var phaseOneProp = cmType.GetProperty("EndingPlayerTurnPhaseOne", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        phaseOneProp?.SetValue(cm, false);
+
+        // Set the combat side back to player and increment round
+        var stateField = cmType.GetField("_state", BindingFlags.NonPublic | BindingFlags.Instance);
+        var state = stateField?.GetValue(cm);
+        if (state != null)
+        {
+            var stateType = state.GetType();
+            // Increment round number
+            var roundProp = stateType.GetProperty("RoundNumber", BindingFlags.Public | BindingFlags.Instance);
+            if (roundProp != null && roundProp.CanWrite)
+            {
+                var currentRound = (int)(roundProp.GetValue(state) ?? 0);
+                roundProp.SetValue(state, currentRound + 1);
+            }
+            // Switch side back to Player (1)
+            var sideProp = stateType.GetProperty("CurrentSide", BindingFlags.Public | BindingFlags.Instance);
+            sideProp?.SetValue(state, (MegaCrit.Sts2.Core.Combat.CombatSide)1);
+        }
+
+        // Call StartTurn via reflection
+        var startTurnMethod = cmType.GetMethod("StartTurn", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (startTurnMethod != null)
+        {
+            Log("Invoking CombatManager.StartTurn via reflection...");
+            var task = (Task?)startTurnMethod.Invoke(cm, new object?[] { null });
+            if (task != null)
+            {
+                _syncCtx.Pump();
+                // Pump until task completes or play phase resumes
+                for (int i = 0; i < 500; i++)
+                {
+                    _syncCtx.Pump();
+                    if (task.IsCompleted) break;
+                    if (CombatManager.Instance.IsPlayPhase) break;
+                    Thread.Sleep(1);
+                }
+            }
+        }
+        else
+        {
+            Log("Could not find StartTurn method");
+        }
+    }
 
     private void WaitForActionExecutor()
     {
