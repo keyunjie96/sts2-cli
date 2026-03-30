@@ -328,6 +328,14 @@ internal class LocLookup
     }
     public string PowerDescription(string entry, int amount)
     {
+        // Try smartDescription first — it contains {Amount} references for dynamic values
+        var smart = Bilingual("powers", entry + ".smartDescription");
+        if (!IsRawKey(smart))
+        {
+            smart = ResolvePowerTemplates(smart, amount);
+            return smart;
+        }
+        // Fall back to .description (has hardcoded values but may still have template patterns)
         var result = Bilingual("powers", entry + ".description");
         if (!IsRawKey(result))
         {
@@ -360,20 +368,86 @@ internal class LocLookup
             .Select(s => char.ToUpper(s[0]) + s[1..].ToLower()));
     }
 
-    /// <summary>Resolve power description templates like {Amount}, {energyPrefix:energyIcons(N)}, and strip BBCode.</summary>
+    /// <summary>Resolve power/card/relic description templates and strip BBCode.
+    /// Handles SmartFormat patterns: energyIcons, plural, diff, cond, abs, singleStarIcon.</summary>
     internal static string ResolvePowerTemplates(string desc, int amount)
     {
-        // Replace {Amount} with actual value
+        // 1. Replace {Amount} (exact) with actual value early so later patterns can use it
         desc = desc.Replace("{Amount}", amount.ToString());
-        // Replace {energyPrefix:energyIcons(N)} with "N Energy"
-        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\{energyPrefix:energyIcons\((\d+)\)\}", m => m.Groups[1].Value + " Energy");
-        // Strip any remaining unresolved template variables like {Var:format}
-        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\{\w+(?::[^}]*)?\}", "");
-        // Replace literal " X " with amount when X is a placeholder
+
+        // 2. {Var:energyIcons(N)} or {energyPrefix:energyIcons(N)} → "N Energy"
+        desc = System.Text.RegularExpressions.Regex.Replace(desc,
+            @"\{\w+:energyIcons\((\d+)\)\}", m => m.Groups[1].Value + " Energy");
+
+        // 3. {Var:energyIcons()} (empty parens) → use the variable's already-substituted value + " Energy"
+        //    If the variable was {Amount:energyIcons()} it's now "{<amount>:energyIcons()}" after step 1? No —
+        //    step 1 only replaced bare {Amount}. Handle by extracting the var name:
+        //    - If var name is a number (already substituted), use that number
+        //    - Otherwise treat it as "Energy"
+        desc = System.Text.RegularExpressions.Regex.Replace(desc,
+            @"\{(\w+):energyIcons\(\)\}", m =>
+            {
+                var varName = m.Groups[1].Value;
+                if (varName.Equals("Amount", System.StringComparison.OrdinalIgnoreCase))
+                    return amount + " Energy";
+                return varName + " Energy";
+            });
+
+        // 4. {singleStarIcon} → "Star"
+        desc = desc.Replace("{singleStarIcon}", "Star");
+
+        // 5. {Amount:diff()} → amount value (diff is a display formatter, just show the number)
+        desc = System.Text.RegularExpressions.Regex.Replace(desc,
+            @"\{Amount:diff\(\)\}", amount.ToString());
+
+        // 6. {Amount:abs()} → absolute value
+        desc = System.Text.RegularExpressions.Regex.Replace(desc,
+            @"\{Amount:abs\(\)\}", Math.Abs(amount).ToString());
+
+        // 7. {Amount:plural:singular|plural} → pick form based on amount
+        //    Also handles {Amount:plural:singular|[blue]{}[/blue] plural} where {} is replaced with amount
+        desc = System.Text.RegularExpressions.Regex.Replace(desc,
+            @"\{Amount:plural:([^|]*)\|([^}]*)\}", m =>
+            {
+                var singular = m.Groups[1].Value;
+                var plural = m.Groups[2].Value;
+                var form = (Math.Abs(amount) == 1) ? singular : plural;
+                // Replace {} inside the chosen form with the amount
+                form = form.Replace("{}", amount.ToString());
+                return form;
+            });
+
+        // 8. {Amount:cond:<0?negText|posText} → pick based on sign
+        desc = System.Text.RegularExpressions.Regex.Replace(desc,
+            @"\{Amount:cond:<0\?([^|]*)\|([^}]*)\}", m =>
+                amount < 0 ? m.Groups[1].Value : m.Groups[2].Value);
+        // {Amount:cond:==1?text1|>1?text2|} (multi-branch) → simplified handling
+        desc = System.Text.RegularExpressions.Regex.Replace(desc,
+            @"\{Amount:cond:==1\?\s*([^|]*)\|>1\?\s*([^|]*)\|[^}]*\}", m =>
+            {
+                var form = (amount == 1) ? m.Groups[1].Value : m.Groups[2].Value;
+                form = form.Replace("{}", amount.ToString());
+                return form;
+            });
+
+        // 9. {Var:diff()}, {Var:abs()}, {Var:percentLess()} for non-Amount vars → strip format, keep var name
+        //    These are stat vars that should have been resolved by DynamicVars; if still present, strip the format
+        desc = System.Text.RegularExpressions.Regex.Replace(desc,
+            @"\{(\w+):(?:diff|abs|percentLess|inverseDiff)\(\)\}", "{$1}");
+
+        // 10. Strip any remaining unresolved template variables like {Var:format}
+        //     (but not simple {Var} which might be meaningful stat names — strip those only if they look like templates)
+        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\{\w+:[^}]+\}", "");
+
+        // 11. Replace literal " X " with amount when X is a placeholder
         if (amount != 0)
             desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\bX\b", amount.ToString());
-        // Strip BBCode
+
+        // 12. Strip BBCode
         desc = StripBBCode(desc);
+
+        // 13. Clean up whitespace (double spaces from removed templates, leading/trailing)
+        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"  +", " ");
         return desc.Trim();
     }
 
@@ -2818,6 +2892,9 @@ public class RunSimulator
                     }
                 }
                 title ??= $"option_{i}";
+                // Clean up any remaining templates/BBCode in title
+                if (title != null && (title.Contains('{') || title.Contains('[')))
+                    title = CleanupDescriptionTemplates(title);
 
                 // Description: try GetFormattedText() first
                 string? optDesc = null;
@@ -2853,6 +2930,9 @@ public class RunSimulator
                 // (e.g. "Add CLUMSY.title to your Deck" -> "Add Clumsy to your Deck")
                 if (optDesc != null)
                     optDesc = _loc.ResolveInlineLocKeys(optDesc);
+                // Clean up remaining templates: energy icons, BBCode, {Var:format} patterns
+                if (optDesc != null)
+                    optDesc = CleanupDescriptionTemplates(optDesc);
 
                 // Build vars for JSON output (resolved names, not raw IDs)
                 Dictionary<string, object?>? optVars = resolvedEventVars.Count > 0
@@ -2916,6 +2996,9 @@ public class RunSimulator
         // Resolve literal localization keys in event description
         if (eventDesc != null)
             eventDesc = _loc.ResolveInlineLocKeys(eventDesc);
+        // Clean up remaining templates: energy icons, BBCode, {Var:format} patterns
+        if (eventDesc != null)
+            eventDesc = CleanupDescriptionTemplates(eventDesc);
 
         return new Dictionary<string, object?>
         {
@@ -2969,6 +3052,28 @@ public class RunSimulator
     }
 
     private static string StripBBCode(string text) => LocLookup.StripBBCode(text);
+
+    /// <summary>Clean up remaining template patterns in any description string:
+    /// energy icons, star icons, BBCode, and unresolved {Var:format} patterns.</summary>
+    private static string CleanupDescriptionTemplates(string desc)
+    {
+        // {Var:energyIcons(N)} → "N Energy"
+        desc = System.Text.RegularExpressions.Regex.Replace(desc,
+            @"\{\w+:energyIcons\((\d+)\)\}", m => m.Groups[1].Value + " Energy");
+        // {Var:energyIcons()} → "Energy"
+        desc = System.Text.RegularExpressions.Regex.Replace(desc,
+            @"\{\w+:energyIcons\(\)\}", "Energy");
+        // {energyPrefix:energyIcons(N)} is already covered by the pattern above
+        // {singleStarIcon} → "Star"
+        desc = desc.Replace("{singleStarIcon}", "Star");
+        // Strip remaining {Var:format} patterns
+        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\{\w+:[^}]+\}", "");
+        // Strip BBCode
+        desc = StripBBCode(desc);
+        // Clean up whitespace
+        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"  +", " ");
+        return desc.Trim();
+    }
 
     private Dictionary<string, object?> RestSiteState(RestSiteRoom restRoom)
     {
@@ -3527,8 +3632,25 @@ public class RunSimulator
                 }
             }
         }
+        // Resolve energy icons: {Var:energyIcons(N)} → "N Energy", {Var:energyIcons()} → "Energy"
+        if (desc.Contains("energyIcons"))
+        {
+            desc = System.Text.RegularExpressions.Regex.Replace(desc,
+                @"\{\w+:energyIcons\((\d+)\)\}", m => m.Groups[1].Value + " Energy");
+            desc = System.Text.RegularExpressions.Regex.Replace(desc,
+                @"\{\w+:energyIcons\(\)\}", "Energy");
+        }
+        // Resolve {singleStarIcon} → "Star"
+        desc = desc.Replace("{singleStarIcon}", "Star");
+        // Resolve {IfUpgraded:show:trueText|falseText} — pick branch based on upgrade status
+        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\{IfUpgraded:show:([^|]*)\|([^}]*)\}",
+            m => c.IsUpgraded ? m.Groups[1].Value : m.Groups[2].Value);
+        // Strip remaining unresolved {Var:format} templates (but keep simple {Var})
+        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\{\w+:[^}]+\}", "");
         // Strip remaining BBCode tags
         desc = StripBBCode(desc);
+        // Clean up double spaces from removed templates
+        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"  +", " ").Trim();
 
         var cardInfo = new Dictionary<string, object?>
         {
