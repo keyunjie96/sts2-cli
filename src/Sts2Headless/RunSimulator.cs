@@ -138,8 +138,9 @@ internal class InlineSynchronizationContext : SynchronizationContext
     /// Default per-callback timeout for Pump(). Any single callback that takes longer
     /// than this is abandoned (the thread it runs on cannot be killed, but we stop waiting).
     /// This prevents the engine from hanging indefinitely on a deadlocked callback.
+    /// Set to 8s to accommodate slow callbacks like reward generation and map transitions.
     /// </summary>
-    private const int DefaultPumpCallbackTimeoutMs = 5000;
+    private const int DefaultPumpCallbackTimeoutMs = 8000;
 
     public void Pump()
     {
@@ -422,9 +423,10 @@ public class RunSimulator
 
     /// <summary>
     /// Global action timeout: no single ExecuteAction call should ever take longer than this.
-    /// If exceeded, the engine force-kills the player and returns an error to prevent hangs.
+    /// If exceeded, the engine force-kills the player and returns a game_over to prevent hangs.
+    /// Set to 20s to accommodate boss fights which legitimately take longer.
     /// </summary>
-    private const int GLOBAL_ACTION_TIMEOUT_MS = 12_000;
+    private const int GLOBAL_ACTION_TIMEOUT_MS = 20_000;
 
     /// <summary>God mode: restore player HP to max after every action. For testing.</summary>
     public bool GodMode { get; set; }
@@ -434,7 +436,7 @@ public class RunSimulator
     /// within <paramref name="timeoutMs"/>, throws a TimeoutException instead of hanging.
     /// This replaces bare .GetAwaiter().GetResult() calls which can block indefinitely.
     /// </summary>
-    private static void RunWithTimeout(Task task, int timeoutMs = 5000, string context = "async call")
+    private static void RunWithTimeout(Task task, int timeoutMs = 8000, string context = "async call")
     {
         if (task.IsCompleted)
         {
@@ -452,7 +454,7 @@ public class RunSimulator
     /// <summary>
     /// Run a Task&lt;T&gt; synchronously with a wall-clock timeout.
     /// </summary>
-    private static T RunWithTimeout<T>(Task<T> task, int timeoutMs = 5000, string context = "async call")
+    private static T RunWithTimeout<T>(Task<T> task, int timeoutMs = 8000, string context = "async call")
     {
         if (task.IsCompleted)
             return task.GetAwaiter().GetResult();
@@ -785,15 +787,11 @@ public class RunSimulator
                 ForceKillPlayer(player);
             }
 
-            // Try to get state after force-kill
-            try
-            {
-                return DetectDecisionPoint();
-            }
-            catch (Exception ex)
-            {
-                return ErrorWithTrace($"Action '{action}' timed out after {GLOBAL_ACTION_TIMEOUT_MS}ms and recovery failed", ex);
-            }
+            // Return a proper game_over so the agent sees a clean loss instead of a
+            // bridge EOF/timeout. This is critical — without it the agent retries and
+            // the 15-25% timeout rate stays high.
+            Log("Global timeout: returning game_over with timeout_recovery=true");
+            return TimeoutGameOverState(action);
         }
         catch (Exception ex)
         {
@@ -1013,12 +1011,13 @@ public class RunSimulator
 
     private Dictionary<string, object?> DoEndTurn(Player player)
     {
-        // HARD wall-clock timeout: the entire DoEndTurn must complete within 15s.
+        // HARD wall-clock timeout: the entire DoEndTurn must complete within 25s.
         // This catches cases where _syncCtx.Pump() itself blocks on a deadlocked
         // callback — the inner Stopwatch-based timeouts can't fire in that scenario
-        // because they only check between pump iterations.
+        // because they only check between pump iterations. Must be > GLOBAL_ACTION_TIMEOUT_MS
+        // so the global watchdog fires first and can return a clean game_over.
         var hardTimer = Stopwatch.StartNew();
-        const int HARD_TIMEOUT_MS = 15_000;
+        const int HARD_TIMEOUT_MS = 25_000;
 
         if (!CombatManager.Instance.IsPlayPhase)
         {
@@ -3088,6 +3087,47 @@ public class RunSimulator
             ["act"] = _runState.CurrentActIndex + 1,
             ["floor"] = _runState.ActFloor,
         };
+    }
+
+    /// <summary>
+    /// Return a game_over response when the global watchdog kills a hung action.
+    /// The agent sees this as a clean loss (victory=false) with a timeout_recovery flag,
+    /// rather than a bridge EOF/timeout which causes retry storms.
+    /// </summary>
+    private Dictionary<string, object?> TimeoutGameOverState(string timedOutAction)
+    {
+        try
+        {
+            var player = _runState!.Players[0];
+            var summary = PlayerSummary(player);
+            // Use last known HP (before the hang) — after ForceKillPlayer, HP is 0
+            summary["hp"] = 0;
+            return new Dictionary<string, object?>
+            {
+                ["type"] = "decision",
+                ["decision"] = "game_over",
+                ["context"] = RunContext(),
+                ["victory"] = false,
+                ["timeout_recovery"] = true,
+                ["timed_out_action"] = timedOutAction,
+                ["player"] = summary,
+                ["act"] = _runState.CurrentActIndex + 1,
+                ["floor"] = _runState.ActFloor,
+            };
+        }
+        catch (Exception ex)
+        {
+            // If even building the game_over state fails, return a minimal one
+            Log($"TimeoutGameOverState failed: {ex.Message}");
+            return new Dictionary<string, object?>
+            {
+                ["type"] = "decision",
+                ["decision"] = "game_over",
+                ["victory"] = false,
+                ["timeout_recovery"] = true,
+                ["timed_out_action"] = timedOutAction,
+            };
+        }
     }
 
     #endregion
