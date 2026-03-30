@@ -386,6 +386,40 @@ internal class LocLookup
         return locKey;
     }
 
+    /// <summary>
+    /// Resolve literal localization keys embedded in text strings.
+    /// Matches patterns like "CLUMSY.title", "SHARP.title", "BYRDONIS_EGG.title"
+    /// and replaces them with the resolved localized text, falling back to
+    /// HumanizeId (UPPER_SNAKE_CASE -> Title Case) if the key is not found.
+    /// </summary>
+    public string ResolveInlineLocKeys(string text)
+    {
+        return System.Text.RegularExpressions.Regex.Replace(text,
+            @"\b([A-Z][A-Z0-9_]+)\.(title|name|description)\b",
+            m =>
+            {
+                var rawId = m.Groups[1].Value;
+                var suffix = m.Groups[2].Value;
+                var locKey = rawId + "." + suffix;
+                // Try to find in loc tables
+                var resolved = BilingualFromKey(locKey);
+                if (resolved != locKey)
+                    return StripBBCode(resolved);
+                // Try common table patterns: cards, relics, potions, powers, enchantments
+                foreach (var table in new[] { "cards", "relics", "potions", "powers", "enchantments", "statuses" })
+                {
+                    var r = Bilingual(table, locKey);
+                    if (r != locKey)
+                        return r;
+                }
+                // Fallback: HumanizeId (strip _POWER etc., then Title Case)
+                var clean = rawId;
+                foreach (var s in new[] { "_POWER", "_RELIC", "_POTION", "_CARD" })
+                    if (clean.EndsWith(s)) { clean = clean[..^s.Length]; break; }
+                return HumanizeId(clean);
+            });
+    }
+
     public bool IsLoaded => _eng.Count > 0;
 }
 
@@ -2802,6 +2836,11 @@ public class RunSimulator
                         optDesc = rd;
                 }
 
+                // Resolve literal localization keys embedded in description text
+                // (e.g. "Add CLUMSY.title to your Deck" -> "Add Clumsy to your Deck")
+                if (optDesc != null)
+                    optDesc = _loc.ResolveInlineLocKeys(optDesc);
+
                 // Build vars for JSON output (resolved names, not raw IDs)
                 Dictionary<string, object?>? optVars = resolvedEventVars.Count > 0
                     ? new Dictionary<string, object?>(resolvedEventVars) : null;
@@ -2861,6 +2900,9 @@ public class RunSimulator
                     eventDesc = SubstituteVars(d, resolvedEventVars);
             }
         }
+        // Resolve literal localization keys in event description
+        if (eventDesc != null)
+            eventDesc = _loc.ResolveInlineLocKeys(eventDesc);
 
         return new Dictionary<string, object?>
         {
