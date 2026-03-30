@@ -913,11 +913,26 @@ public class RunSimulator
     private int _combatTurnCount;
 
     /// <summary>
+    /// Combat action counter — incremented on every combat action (play_card, end_turn,
+    /// use_potion). Catches infinite loops where the strategy plays cards without ever
+    /// ending the turn, which would prevent _combatTurnCount from incrementing.
+    /// </summary>
+    private int _combatActionCount;
+
+    /// <summary>
     /// Maximum combat turns before force-ending. God-mode combats that exceed this
     /// are force-won (player declared winner) to prevent OOM from growing action queues,
     /// power lists, and sync context callback accumulation.
     /// </summary>
     private const int MAX_COMBAT_TURNS = 50;
+
+    /// <summary>
+    /// Maximum total combat actions (card plays + end turns + potions) before force-ending.
+    /// This catches infinite card-play loops where the bot never calls end_turn,
+    /// so _combatTurnCount never increments and MAX_COMBAT_TURNS never triggers.
+    /// Set to 500 (roughly 50 turns × 10 cards per turn) as a generous upper bound.
+    /// </summary>
+    private const int MAX_COMBAT_ACTIONS = 500;
 
     /// <summary>
     /// Global action timeout: no single ExecuteAction call should ever take longer than this.
@@ -1130,6 +1145,7 @@ public class RunSimulator
             Log($"EnterRoom: type={roomType} encounter={encounter} event={eventId}");
             _shopCardRemoved = false;
             _combatTurnCount = 0;
+            _combatActionCount = 0;
 
             AbstractRoom room;
             switch (roomType.ToLowerInvariant())
@@ -1242,10 +1258,13 @@ public class RunSimulator
                 }
                 catch { }
 
-                // Force-win long combats to prevent OOM from unbounded action/callback growth
-                if (_combatTurnCount > MAX_COMBAT_TURNS && CombatManager.Instance.IsInProgress)
+                // Force-win long combats to prevent OOM from unbounded action/callback growth.
+                // Check both turn count AND total action count — the action count catches
+                // infinite card-play loops where end_turn is never called.
+                var combatLimitExceeded = _combatTurnCount > MAX_COMBAT_TURNS || _combatActionCount > MAX_COMBAT_ACTIONS;
+                if (combatLimitExceeded && CombatManager.Instance.IsInProgress)
                 {
-                    Log($"God mode: combat exceeded {MAX_COMBAT_TURNS} turns ({_combatTurnCount}). Force-winning to prevent OOM.");
+                    Log($"God mode: combat exceeded limits (turns={_combatTurnCount}/{MAX_COMBAT_TURNS}, actions={_combatActionCount}/{MAX_COMBAT_ACTIONS}). Force-winning to prevent OOM.");
                     // Kill all enemies to end combat as a win (rather than killing the player)
                     try
                     {
@@ -1273,6 +1292,7 @@ public class RunSimulator
                     // Clear accumulated callbacks to free memory
                     _syncCtx.ClearQueue();
                     _combatTurnCount = 0;
+                    _combatActionCount = 0;
 
                     // If enemies didn't die cleanly, fall back to force-killing player
                     if (CombatManager.Instance.IsInProgress)
@@ -1370,6 +1390,13 @@ public class RunSimulator
     /// </summary>
     private Dictionary<string, object?> ExecuteActionInner(Player player, string action, Dictionary<string, object?>? args)
     {
+        // Increment combat action counter for all combat-relevant actions.
+        // This catches infinite loops where the bot plays cards without ending the turn.
+        if (action is "play_card" or "end_turn" or "use_potion" && CombatManager.Instance.IsInProgress)
+        {
+            _combatActionCount++;
+        }
+
         switch (action)
         {
             case "select_map_node":
@@ -1434,6 +1461,7 @@ public class RunSimulator
         _lastKnownHp = player.Creature?.CurrentHp ?? 0;
         _shopCardRemoved = false;
         _combatTurnCount = 0;
+        _combatActionCount = 0;
         _consecutiveForceStarts = 0;
 
         var col = Convert.ToInt32(args["col"]);
