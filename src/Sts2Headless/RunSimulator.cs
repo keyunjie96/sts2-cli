@@ -1680,8 +1680,30 @@ public class RunSimulator
         {
             if (combatRoom.IsPreFinished || !CombatManager.Instance.IsInProgress)
             {
-                RunManager.Instance.EnterNextAct().GetAwaiter().GetResult();
-                WaitForActionExecutor();
+                var actTimer = Stopwatch.StartNew();
+                try
+                {
+                    YieldPatches.SuppressYield = true;
+                    var task = RunManager.Instance.EnterNextAct();
+                    while (!task.IsCompleted && actTimer.ElapsedMilliseconds < 10_000)
+                    {
+                        _syncCtx.Pump();
+                        Thread.Sleep(10);
+                    }
+                    YieldPatches.SuppressYield = false;
+                    if (task.IsCompleted)
+                    {
+                        _syncCtx.Pump();
+                        WaitForActionExecutor();
+                    }
+                    else
+                    {
+                        Log($"DoProceed: EnterNextAct timed out after {actTimer.ElapsedMilliseconds}ms");
+                        try { _syncCtx.PumpWithTimeout(perCallbackTimeoutMs: 500); } catch { }
+                    }
+                }
+                catch (Exception ex) { Log($"DoProceed EnterNextAct: {ex.Message}"); }
+                finally { YieldPatches.SuppressYield = false; }
                 return DetectDecisionPoint();
             }
         }
@@ -2274,13 +2296,35 @@ public class RunSimulator
         if (combatRoom.RoomType == RoomType.Boss)
         {
             Log("Boss defeated, entering next act");
+            var actTimer = Stopwatch.StartNew();
             try
             {
-                RunManager.Instance.EnterNextAct().GetAwaiter().GetResult();
-                _syncCtx.Pump();
-                WaitForActionExecutor();
+                // EnterNextAct can hang if async callbacks deadlock.
+                // Use SuppressYield to prevent Task.Yield blocking, and
+                // pump with a hard timeout.
+                YieldPatches.SuppressYield = true;
+                var task = RunManager.Instance.EnterNextAct();
+                // Pump while waiting, with a 10s hard timeout
+                while (!task.IsCompleted && actTimer.ElapsedMilliseconds < 10_000)
+                {
+                    _syncCtx.Pump();
+                    Thread.Sleep(10);
+                }
+                YieldPatches.SuppressYield = false;
+                if (!task.IsCompleted)
+                {
+                    Log($"EnterNextAct timed out after {actTimer.ElapsedMilliseconds}ms — forcing map transition");
+                    // Force to map even if EnterNextAct didn't complete
+                    try { _syncCtx.PumpWithTimeout(perCallbackTimeoutMs: 500); } catch { }
+                }
+                else
+                {
+                    _syncCtx.Pump();
+                    WaitForActionExecutor();
+                }
             }
             catch (Exception ex) { Log($"EnterNextAct: {ex.Message}"); }
+            finally { YieldPatches.SuppressYield = false; }
             return DetectDecisionPoint();
         }
 
