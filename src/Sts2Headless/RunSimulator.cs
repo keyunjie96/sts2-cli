@@ -21,6 +21,7 @@ using MegaCrit.Sts2.Core.Entities.RestSite;
 using MegaCrit.Sts2.Core.Rewards;
 using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Models.Powers;
+using MegaCrit.Sts2.Core.Entities.Powers;
 using MegaCrit.Sts2.Core.GameActions.Multiplayer;
 using MegaCrit.Sts2.Core.Runs;
 using MegaCrit.Sts2.Core.TestSupport;
@@ -2966,6 +2967,7 @@ public class RunSimulator
                     ["name"] = _loc.Power(pw.Id.Entry),
                     ["description"] = _loc.PowerDescription(pw.Id.Entry, pw.Amount),
                     ["amount"] = pw.Amount,
+                    ["type"] = pw.TypeForCurrentAmount == PowerType.Buff ? "buff" : pw.TypeForCurrentAmount == PowerType.Debuff ? "debuff" : null,
                 }).ToList();
 
                 return new Dictionary<string, object?>
@@ -2987,6 +2989,7 @@ public class RunSimulator
             ["name"] = _loc.Power(pw.Id.Entry),
             ["description"] = _loc.PowerDescription(pw.Id.Entry, pw.Amount),
             ["amount"] = pw.Amount,
+            ["type"] = pw.TypeForCurrentAmount == PowerType.Buff ? "buff" : pw.TypeForCurrentAmount == PowerType.Debuff ? "debuff" : null,
         }).ToList();
 
         // Compute per-card effective damage against each enemy
