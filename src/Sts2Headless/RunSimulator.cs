@@ -49,6 +49,76 @@ internal class InlineSynchronizationContext : SynchronizationContext
     /// </summary>
     private const int MaxDrainPerCycle = 10_000;
 
+    /// <summary>
+    /// Default per-callback timeout. Any single callback that takes longer
+    /// than this is abandoned (the thread it runs on cannot be killed, but we stop waiting).
+    /// Reduced from 8s to 5s since we now actively drain the queue while waiting,
+    /// so legitimate callbacks complete faster and only true deadlocks hit this timeout.
+    /// </summary>
+    private const int DefaultPumpCallbackTimeoutMs = 5000;
+
+    /// <summary>
+    /// Dispatch a callback to ThreadPool and wait for it, while actively draining
+    /// the queue to prevent deadlocks. The classic deadlock: callback awaits something
+    /// that posts a continuation to this sync context, but Pump/Post is blocked on
+    /// done.Wait() and can't drain the queue. Fix: interleave queue draining with waiting.
+    /// Returns true if the callback completed within the timeout, false if abandoned.
+    /// </summary>
+    private bool RunCallbackWithDrain(SendOrPostCallback d, object? state, int timeoutMs, string caller)
+    {
+        var done = new ManualResetEventSlim(false);
+        Exception? cbException = null;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try { d(state); }
+            catch (Exception ex) { cbException = ex; }
+            finally { done.Set(); }
+        });
+
+        // Instead of blocking on done.Wait(timeout), we poll with short waits
+        // and drain newly-queued callbacks between polls. This allows async
+        // continuations posted by the running callback to execute, breaking
+        // the deadlock where the callback waits for a continuation that's
+        // stuck in our queue.
+        var timer = Stopwatch.StartNew();
+        while (!done.IsSet && timer.ElapsedMilliseconds < timeoutMs)
+        {
+            // Short wait — gives the callback time to run, but doesn't block long
+            if (done.Wait(5))
+                break;
+
+            // Drain any callbacks that were queued while the main callback ran.
+            // These are typically async continuations that the main callback is
+            // waiting on — executing them here breaks the deadlock.
+            int innerDrained = 0;
+            while (_queue.Count > 0 && innerDrained < 100 && !done.IsSet)
+            {
+                var (cb, st) = _queue.Dequeue();
+                try
+                {
+                    cb(st); // Execute inline on THIS thread — safe because _executing is true
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[WARN] SyncCtx.{caller} inline drain threw: {ex.GetType().Name}: {ex.Message}");
+                }
+                innerDrained++;
+            }
+        }
+
+        if (!done.IsSet)
+        {
+            Console.Error.WriteLine($"[WARN] SyncCtx.{caller}: callback timed out after {timeoutMs}ms (queue={_queue.Count})");
+            if (cbException != null)
+                Console.Error.WriteLine($"[WARN] SyncCtx.{caller} callback also threw: {cbException.GetType().Name}: {cbException.Message}");
+            return false;
+        }
+
+        if (cbException != null)
+            Console.Error.WriteLine($"[WARN] SyncCtx.{caller} callback threw: {cbException.GetType().Name}: {cbException.Message}");
+        return true;
+    }
+
     public override void Post(SendOrPostCallback d, object? state)
     {
         if (_executing)
@@ -58,50 +128,23 @@ internal class InlineSynchronizationContext : SynchronizationContext
         }
 
         // Execute inline immediately, then drain any nested posts.
-        // Each callback is time-boxed to prevent indefinite hangs.
         _executing = true;
         try
         {
-            var done = new ManualResetEventSlim(false);
-            Exception? postException = null;
-            ThreadPool.QueueUserWorkItem(_ =>
+            if (!RunCallbackWithDrain(d, state, DefaultPumpCallbackTimeoutMs, "Post"))
             {
-                try { d(state); }
-                catch (Exception ex) { postException = ex; }
-                finally { done.Set(); }
-            });
-            if (!done.Wait(DefaultPumpCallbackTimeoutMs))
-            {
-                Console.Error.WriteLine($"[WARN] SyncCtx.Post: initial callback timed out after {DefaultPumpCallbackTimeoutMs}ms");
                 _executing = false;
                 return;
             }
-            if (postException != null)
-            {
-                Console.Error.WriteLine($"[WARN] SyncCtx.Post callback threw: {postException.GetType().Name}: {postException.Message}");
-            }
-            // Drain any callbacks that were queued during execution
+            // Drain any remaining callbacks that were queued during execution
             int drained = 0;
             while (_queue.Count > 0 && drained < MaxDrainPerCycle)
             {
                 var (cb, st) = _queue.Dequeue();
                 try
                 {
-                    var cbDone = new ManualResetEventSlim(false);
-                    Exception? cbEx = null;
-                    ThreadPool.QueueUserWorkItem(_ =>
-                    {
-                        try { cb(st); }
-                        catch (Exception ex) { cbEx = ex; }
-                        finally { cbDone.Set(); }
-                    });
-                    if (!cbDone.Wait(DefaultPumpCallbackTimeoutMs))
-                    {
-                        Console.Error.WriteLine($"[WARN] SyncCtx.Post drain: callback timed out after {DefaultPumpCallbackTimeoutMs}ms, stopping drain ({_queue.Count} remaining)");
+                    if (!RunCallbackWithDrain(cb, st, DefaultPumpCallbackTimeoutMs, "Post.drain"))
                         break;
-                    }
-                    if (cbEx != null)
-                        Console.Error.WriteLine($"[WARN] SyncCtx.Post drain callback threw: {cbEx.GetType().Name}: {cbEx.Message}");
                 }
                 catch (Exception ex)
                 {
@@ -134,19 +177,11 @@ internal class InlineSynchronizationContext : SynchronizationContext
         }
     }
 
-    /// <summary>
-    /// Default per-callback timeout for Pump(). Any single callback that takes longer
-    /// than this is abandoned (the thread it runs on cannot be killed, but we stop waiting).
-    /// This prevents the engine from hanging indefinitely on a deadlocked callback.
-    /// Set to 8s to accommodate slow callbacks like reward generation and map transitions.
-    /// </summary>
-    private const int DefaultPumpCallbackTimeoutMs = 8000;
-
     public void Pump()
     {
-        // Drain any remaining queued callbacks with a per-callback timeout.
-        // This is the critical anti-hang measure: every callback is time-boxed
-        // so a single deadlocked continuation cannot block the engine forever.
+        // Drain queued callbacks. Each callback runs on ThreadPool but we actively
+        // drain the queue while waiting, preventing the classic deadlock where a
+        // callback's async continuation is stuck in our queue.
         int drained = 0;
         while (_queue.Count > 0 && drained < MaxDrainPerCycle)
         {
@@ -154,23 +189,11 @@ internal class InlineSynchronizationContext : SynchronizationContext
             _executing = true;
             try
             {
-                // Run callback on ThreadPool with timeout to prevent indefinite hangs
-                var done = new ManualResetEventSlim(false);
-                Exception? cbException = null;
-                ThreadPool.QueueUserWorkItem(_ =>
+                if (!RunCallbackWithDrain(cb, st, DefaultPumpCallbackTimeoutMs, "Pump"))
                 {
-                    try { cb(st); }
-                    catch (Exception ex) { cbException = ex; }
-                    finally { done.Set(); }
-                });
-                if (!done.Wait(DefaultPumpCallbackTimeoutMs))
-                {
-                    Console.Error.WriteLine($"[WARN] SyncCtx.Pump: callback timed out after {DefaultPumpCallbackTimeoutMs}ms, abandoning remaining queue ({_queue.Count} items)");
                     _executing = false;
                     break;
                 }
-                if (cbException != null)
-                    Console.Error.WriteLine($"[WARN] SyncCtx.Pump callback threw: {cbException.GetType().Name}: {cbException.Message}");
             }
             catch (Exception ex)
             {
@@ -188,9 +211,8 @@ internal class InlineSynchronizationContext : SynchronizationContext
 
     /// <summary>
     /// Pump with a per-callback timeout. If any single callback takes longer than
-    /// <paramref name="perCallbackTimeoutMs"/>, we abandon it (it runs on a thread
-    /// we can't kill, but we stop waiting) and skip remaining callbacks to return
-    /// control to the caller. Returns false if a timeout occurred.
+    /// <paramref name="perCallbackTimeoutMs"/>, we abandon it and skip remaining
+    /// callbacks. Returns false if a timeout occurred.
     /// </summary>
     public bool PumpWithTimeout(int perCallbackTimeoutMs = 3000)
     {
@@ -202,24 +224,12 @@ internal class InlineSynchronizationContext : SynchronizationContext
             _executing = true;
             try
             {
-                // Run the callback on a ThreadPool thread so we can time-box it
-                var done = new ManualResetEventSlim(false);
-                Exception? cbException = null;
-                ThreadPool.QueueUserWorkItem(_ =>
+                if (!RunCallbackWithDrain(cb, st, perCallbackTimeoutMs, "PumpWithTimeout"))
                 {
-                    try { cb(st); }
-                    catch (Exception ex) { cbException = ex; }
-                    finally { done.Set(); }
-                });
-                if (!done.Wait(perCallbackTimeoutMs))
-                {
-                    Console.Error.WriteLine($"[WARN] SyncCtx.PumpWithTimeout: callback timed out after {perCallbackTimeoutMs}ms, abandoning remaining queue ({_queue.Count} items)");
                     timedOut = true;
                     _executing = false;
                     break;
                 }
-                if (cbException != null)
-                    Console.Error.WriteLine($"[WARN] SyncCtx.PumpWithTimeout callback threw: {cbException.GetType().Name}: {cbException.Message}");
             }
             catch (Exception ex)
             {
@@ -787,6 +797,9 @@ public class RunSimulator
 
             var actionThread = new Thread(() =>
             {
+                // Ensure this thread uses our sync context so async continuations
+                // from game code are posted to our queue (not the default ThreadPool).
+                SynchronizationContext.SetSynchronizationContext(_syncCtx);
                 try
                 {
                     result = ExecuteActionInner(player, action, args);
