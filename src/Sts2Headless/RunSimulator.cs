@@ -57,11 +57,29 @@ internal class InlineSynchronizationContext : SynchronizationContext
             return;
         }
 
-        // Execute inline immediately, then drain any nested posts
+        // Execute inline immediately, then drain any nested posts.
+        // Each callback is time-boxed to prevent indefinite hangs.
         _executing = true;
         try
         {
-            d(state);
+            var done = new ManualResetEventSlim(false);
+            Exception? postException = null;
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try { d(state); }
+                catch (Exception ex) { postException = ex; }
+                finally { done.Set(); }
+            });
+            if (!done.Wait(DefaultPumpCallbackTimeoutMs))
+            {
+                Console.Error.WriteLine($"[WARN] SyncCtx.Post: initial callback timed out after {DefaultPumpCallbackTimeoutMs}ms");
+                _executing = false;
+                return;
+            }
+            if (postException != null)
+            {
+                Console.Error.WriteLine($"[WARN] SyncCtx.Post callback threw: {postException.GetType().Name}: {postException.Message}");
+            }
             // Drain any callbacks that were queued during execution
             int drained = 0;
             while (_queue.Count > 0 && drained < MaxDrainPerCycle)
@@ -69,11 +87,25 @@ internal class InlineSynchronizationContext : SynchronizationContext
                 var (cb, st) = _queue.Dequeue();
                 try
                 {
-                    cb(st);
+                    var cbDone = new ManualResetEventSlim(false);
+                    Exception? cbEx = null;
+                    ThreadPool.QueueUserWorkItem(_ =>
+                    {
+                        try { cb(st); }
+                        catch (Exception ex) { cbEx = ex; }
+                        finally { cbDone.Set(); }
+                    });
+                    if (!cbDone.Wait(DefaultPumpCallbackTimeoutMs))
+                    {
+                        Console.Error.WriteLine($"[WARN] SyncCtx.Post drain: callback timed out after {DefaultPumpCallbackTimeoutMs}ms, stopping drain ({_queue.Count} remaining)");
+                        break;
+                    }
+                    if (cbEx != null)
+                        Console.Error.WriteLine($"[WARN] SyncCtx.Post drain callback threw: {cbEx.GetType().Name}: {cbEx.Message}");
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine($"[WARN] SyncCtx.Post drain callback threw: {ex.GetType().Name}: {ex.Message}");
+                    Console.Error.WriteLine($"[WARN] SyncCtx.Post drain threw: {ex.GetType().Name}: {ex.Message}");
                 }
                 drained++;
             }
@@ -82,10 +114,7 @@ internal class InlineSynchronizationContext : SynchronizationContext
         }
         catch (Exception ex)
         {
-            // The initial d(state) call threw — log but don't crash the process.
-            // The caller (an async continuation) posted to this context and expects
-            // errors to be captured by the Task machinery, not to crash the host.
-            Console.Error.WriteLine($"[WARN] SyncCtx.Post callback threw: {ex.GetType().Name}: {ex.Message}");
+            Console.Error.WriteLine($"[WARN] SyncCtx.Post threw: {ex.GetType().Name}: {ex.Message}");
         }
         finally
         {
@@ -105,9 +134,18 @@ internal class InlineSynchronizationContext : SynchronizationContext
         }
     }
 
+    /// <summary>
+    /// Default per-callback timeout for Pump(). Any single callback that takes longer
+    /// than this is abandoned (the thread it runs on cannot be killed, but we stop waiting).
+    /// This prevents the engine from hanging indefinitely on a deadlocked callback.
+    /// </summary>
+    private const int DefaultPumpCallbackTimeoutMs = 5000;
+
     public void Pump()
     {
-        // Drain any remaining queued callbacks
+        // Drain any remaining queued callbacks with a per-callback timeout.
+        // This is the critical anti-hang measure: every callback is time-boxed
+        // so a single deadlocked continuation cannot block the engine forever.
         int drained = 0;
         while (_queue.Count > 0 && drained < MaxDrainPerCycle)
         {
@@ -115,11 +153,27 @@ internal class InlineSynchronizationContext : SynchronizationContext
             _executing = true;
             try
             {
-                cb(st);
+                // Run callback on ThreadPool with timeout to prevent indefinite hangs
+                var done = new ManualResetEventSlim(false);
+                Exception? cbException = null;
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    try { cb(st); }
+                    catch (Exception ex) { cbException = ex; }
+                    finally { done.Set(); }
+                });
+                if (!done.Wait(DefaultPumpCallbackTimeoutMs))
+                {
+                    Console.Error.WriteLine($"[WARN] SyncCtx.Pump: callback timed out after {DefaultPumpCallbackTimeoutMs}ms, abandoning remaining queue ({_queue.Count} items)");
+                    _executing = false;
+                    break;
+                }
+                if (cbException != null)
+                    Console.Error.WriteLine($"[WARN] SyncCtx.Pump callback threw: {cbException.GetType().Name}: {cbException.Message}");
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"[WARN] SyncCtx.Pump callback threw: {ex.GetType().Name}: {ex.Message}");
+                Console.Error.WriteLine($"[WARN] SyncCtx.Pump threw: {ex.GetType().Name}: {ex.Message}");
             }
             finally
             {
@@ -366,8 +420,46 @@ public class RunSimulator
     // Track whether a card has already been removed during this shop visit (only one removal per visit)
     private bool _shopCardRemoved;
 
+    /// <summary>
+    /// Global action timeout: no single ExecuteAction call should ever take longer than this.
+    /// If exceeded, the engine force-kills the player and returns an error to prevent hangs.
+    /// </summary>
+    private const int GLOBAL_ACTION_TIMEOUT_MS = 12_000;
+
     /// <summary>God mode: restore player HP to max after every action. For testing.</summary>
     public bool GodMode { get; set; }
+
+    /// <summary>
+    /// Run a Task synchronously with a wall-clock timeout. If the task does not complete
+    /// within <paramref name="timeoutMs"/>, throws a TimeoutException instead of hanging.
+    /// This replaces bare .GetAwaiter().GetResult() calls which can block indefinitely.
+    /// </summary>
+    private static void RunWithTimeout(Task task, int timeoutMs = 5000, string context = "async call")
+    {
+        if (task.IsCompleted)
+        {
+            task.GetAwaiter().GetResult(); // propagate any exception
+            return;
+        }
+        if (task.Wait(timeoutMs))
+        {
+            task.GetAwaiter().GetResult(); // propagate any exception
+            return;
+        }
+        throw new TimeoutException($"{context} did not complete within {timeoutMs}ms");
+    }
+
+    /// <summary>
+    /// Run a Task&lt;T&gt; synchronously with a wall-clock timeout.
+    /// </summary>
+    private static T RunWithTimeout<T>(Task<T> task, int timeoutMs = 5000, string context = "async call")
+    {
+        if (task.IsCompleted)
+            return task.GetAwaiter().GetResult();
+        if (task.Wait(timeoutMs))
+            return task.GetAwaiter().GetResult();
+        throw new TimeoutException($"{context} did not complete within {timeoutMs}ms");
+    }
 
     public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null, string lang = "en")
     {
@@ -411,11 +503,11 @@ public class RunSimulator
             CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
 
             // Finalize starting relics
-            RunManager.Instance.FinalizeStartingRelics().GetAwaiter().GetResult();
+            RunWithTimeout(RunManager.Instance.FinalizeStartingRelics(), 5000, "FinalizeStartingRelics");
             Log("Starting relics finalized");
 
             // Enter first act (generates map)
-            RunManager.Instance.EnterAct(0, doTransition: false).GetAwaiter().GetResult();
+            RunWithTimeout(RunManager.Instance.EnterAct(0, doTransition: false), 5000, "EnterAct");
             Log("Entered Act 0");
 
             // Register card selector for cards that need player choice
@@ -578,7 +670,7 @@ public class RunSimulator
             // Wait for any pending relic session before entering a new room
             WaitForRelicPickingComplete();
 
-            RunManager.Instance.EnterRoom(room).GetAwaiter().GetResult();
+            RunWithTimeout(RunManager.Instance.EnterRoom(room), 5000, "EnterRoom");
             _syncCtx.Pump();
             WaitForActionExecutor();
             return DetectDecisionPoint();
@@ -648,55 +740,116 @@ public class RunSimulator
                 catch { }
             }
 
-            switch (action)
+            // GLOBAL WATCHDOG: Run the action dispatch with a hard wall-clock timeout.
+            // This is the last line of defense against hangs — if any action (including
+            // all its Pump/WaitForActionExecutor/GetAwaiter calls) exceeds the timeout,
+            // we force-kill the player and return an error rather than hanging forever.
+            var actionTimer = Stopwatch.StartNew();
+            Dictionary<string, object?>? result = null;
+            Exception? actionException = null;
+            var actionDone = new ManualResetEventSlim(false);
+
+            var actionThread = new Thread(() =>
             {
-                case "select_map_node":
-                    return DoMapSelect(player, args);
-                case "play_card":
-                    return DoPlayCard(player, args);
-                case "end_turn":
-                    return DoEndTurn(player);
-                case "choose_option":
-                    return DoChooseOption(player, args);
-                case "select_card_reward":
-                    return DoSelectCardReward(player, args);
-                case "skip_card_reward":
-                    return DoSkipCardReward(player);
-                case "buy_card":
-                    return DoBuyCard(player, args);
-                case "buy_relic":
-                    return DoBuyRelic(player, args);
-                case "buy_potion":
-                    return DoBuyPotion(player, args);
-                case "remove_card":
-                    return DoRemoveCard(player);
-                case "select_bundle":
-                    return DoSelectBundle(player, args);
-                case "select_cards":
-                    return DoSelectCards(player, args);
-                case "skip_select":
-                    return DoSkipSelect(player);
-                case "use_potion":
-                    return DoUsePotion(player, args);
-                case "discard_potion":
-                    return DoDiscardPotion(player, args);
-                case "collect_potion_reward":
-                    return DoCollectPotionReward(player, args);
-                case "discard_potion_for_reward":
-                    return DoDiscardPotionForReward(player, args);
-                case "skip_potion_reward":
-                    return DoSkipPotionReward(player, args);
-                case "leave_room":
-                    return DoLeaveRoom(player);
-                case "proceed":
-                    return DoProceed(player);
-                default:
-                    return Error($"Unknown action: {action}");
+                try
+                {
+                    result = ExecuteActionInner(player, action, args);
+                }
+                catch (Exception ex)
+                {
+                    actionException = ex;
+                }
+                finally
+                {
+                    actionDone.Set();
+                }
+            });
+            actionThread.IsBackground = true;
+            actionThread.Start();
+
+            if (actionDone.Wait(GLOBAL_ACTION_TIMEOUT_MS))
+            {
+                // Action completed within timeout
+                if (actionException != null)
+                    return ErrorWithTrace($"Action '{action}' failed", actionException);
+                return result ?? Error($"Action '{action}' returned null");
+            }
+
+            // GLOBAL TIMEOUT HIT — the action is hung. Force-recover.
+            Log($"GLOBAL ACTION TIMEOUT: '{action}' did not complete within {GLOBAL_ACTION_TIMEOUT_MS}ms ({actionTimer.ElapsedMilliseconds}ms elapsed)");
+
+            // Force-kill the player to end any stuck combat
+            if (CombatManager.Instance.IsInProgress && player.Creature != null && !player.Creature.IsDead)
+            {
+                Log("Global timeout: force-killing player to end stuck combat");
+                ForceKillPlayer(player);
+            }
+
+            // Try to get state after force-kill
+            try
+            {
+                return DetectDecisionPoint();
+            }
+            catch (Exception ex)
+            {
+                return ErrorWithTrace($"Action '{action}' timed out after {GLOBAL_ACTION_TIMEOUT_MS}ms and recovery failed", ex);
             }
         }
         catch (Exception ex)
         {
             return ErrorWithTrace($"Action '{action}' failed", ex);
+        }
+    }
+
+    /// <summary>
+    /// Inner action dispatch — called from ExecuteAction within a global timeout wrapper.
+    /// </summary>
+    private Dictionary<string, object?> ExecuteActionInner(Player player, string action, Dictionary<string, object?>? args)
+    {
+        switch (action)
+        {
+            case "select_map_node":
+                return DoMapSelect(player, args);
+            case "play_card":
+                return DoPlayCard(player, args);
+            case "end_turn":
+                return DoEndTurn(player);
+            case "choose_option":
+                return DoChooseOption(player, args);
+            case "select_card_reward":
+                return DoSelectCardReward(player, args);
+            case "skip_card_reward":
+                return DoSkipCardReward(player);
+            case "buy_card":
+                return DoBuyCard(player, args);
+            case "buy_relic":
+                return DoBuyRelic(player, args);
+            case "buy_potion":
+                return DoBuyPotion(player, args);
+            case "remove_card":
+                return DoRemoveCard(player);
+            case "select_bundle":
+                return DoSelectBundle(player, args);
+            case "select_cards":
+                return DoSelectCards(player, args);
+            case "skip_select":
+                return DoSkipSelect(player);
+            case "use_potion":
+                return DoUsePotion(player, args);
+            case "discard_potion":
+                return DoDiscardPotion(player, args);
+            case "collect_potion_reward":
+                return DoCollectPotionReward(player, args);
+            case "discard_potion_for_reward":
+                return DoDiscardPotionForReward(player, args);
+            case "skip_potion_reward":
+                return DoSkipPotionReward(player, args);
+            case "leave_room":
+                return DoLeaveRoom(player);
+            case "proceed":
+                return DoProceed(player);
+            default:
+                return Error($"Unknown action: {action}");
         }
     }
 
@@ -734,7 +887,7 @@ public class RunSimulator
         bool enterSucceeded = false;
         try
         {
-            RunManager.Instance.EnterMapCoord(coord).GetAwaiter().GetResult();
+            RunWithTimeout(RunManager.Instance.EnterMapCoord(coord), 5000, "EnterMapCoord");
             _syncCtx.Pump();
             WaitForActionExecutor();
             enterSucceeded = true;
@@ -746,7 +899,7 @@ public class RunSimulator
             ForceResetRelicPickingState();
             try
             {
-                RunManager.Instance.EnterMapCoord(coord).GetAwaiter().GetResult();
+                RunWithTimeout(RunManager.Instance.EnterMapCoord(coord), 5000, "EnterMapCoord retry");
                 _syncCtx.Pump();
                 WaitForActionExecutor();
                 enterSucceeded = true;
@@ -1172,9 +1325,10 @@ public class RunSimulator
         // Add card to deck
         try
         {
-            MegaCrit.Sts2.Core.Commands.CardPileCmd
-                .Add(card, MegaCrit.Sts2.Core.Entities.Cards.PileType.Deck)
-                .GetAwaiter().GetResult();
+            RunWithTimeout(
+                MegaCrit.Sts2.Core.Commands.CardPileCmd
+                    .Add(card, MegaCrit.Sts2.Core.Entities.Cards.PileType.Deck),
+                5000, "CardPileCmd.Add");
             _syncCtx.Pump();
             RunManager.Instance.RewardSynchronizer.SyncLocalObtainedCard(card);
         }
@@ -1234,7 +1388,7 @@ public class RunSimulator
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.Inventory).GetAwaiter().GetResult();
+            RunWithTimeout(entry.OnTryPurchaseWrapper(merchantRoom.Inventory), 5000, "OnTryPurchaseWrapper");
             _syncCtx.Pump();
             Log($"Bought card: {entry.CreationResult?.Card?.GetType().Name ?? "?"} for {entry.Cost}g");
         }
@@ -1260,7 +1414,7 @@ public class RunSimulator
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.Inventory).GetAwaiter().GetResult();
+            RunWithTimeout(entry.OnTryPurchaseWrapper(merchantRoom.Inventory), 5000, "OnTryPurchaseWrapper");
             _syncCtx.Pump();
             Log($"Bought relic: {entry.Model.GetType().Name} for {entry.Cost}g");
         }
@@ -1286,7 +1440,7 @@ public class RunSimulator
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.Inventory).GetAwaiter().GetResult();
+            RunWithTimeout(entry.OnTryPurchaseWrapper(merchantRoom.Inventory), 5000, "OnTryPurchaseWrapper");
             _syncCtx.Pump();
             Log($"Bought potion: {entry.Model.GetType().Name} for {entry.Cost}g");
         }
@@ -1470,7 +1624,7 @@ public class RunSimulator
             {
                 // Potion wasn't consumed — manually discard it
                 Log("Potion not consumed by action, manually discarding");
-                MegaCrit.Sts2.Core.Commands.PotionCmd.Discard(potion).GetAwaiter().GetResult();
+                RunWithTimeout(MegaCrit.Sts2.Core.Commands.PotionCmd.Discard(potion), 3000, "PotionCmd.Discard");
                 _syncCtx.Pump();
             }
         }
@@ -1478,7 +1632,7 @@ public class RunSimulator
         {
             Log($"Use potion failed: {ex.Message}");
             // Try manual discard as fallback
-            try { MegaCrit.Sts2.Core.Commands.PotionCmd.Discard(potion).GetAwaiter().GetResult(); } catch { }
+            try { RunWithTimeout(MegaCrit.Sts2.Core.Commands.PotionCmd.Discard(potion), 3000, "PotionCmd.Discard fallback"); } catch { }
         }
 
         return DetectDecisionPoint();
@@ -1495,7 +1649,7 @@ public class RunSimulator
         var potion = potionsList[idx];
         if (potion == null) return Error($"No potion at index {idx}");
 
-        MegaCrit.Sts2.Core.Commands.PotionCmd.Discard(potion).GetAwaiter().GetResult();
+        RunWithTimeout(MegaCrit.Sts2.Core.Commands.PotionCmd.Discard(potion), 3000, "PotionCmd.Discard");
         _syncCtx.Pump();
         return DetectDecisionPoint();
     }
@@ -1520,7 +1674,7 @@ public class RunSimulator
         var potionReward = _pendingPotionRewards[idx];
         try
         {
-            potionReward.OnSelectWrapper().GetAwaiter().GetResult();
+            RunWithTimeout(potionReward.OnSelectWrapper(), 5000, "PotionReward.OnSelectWrapper");
             _syncCtx.Pump();
             Log($"Collected potion reward: {potionReward.Potion?.Id.Entry}");
         }
@@ -1555,7 +1709,7 @@ public class RunSimulator
 
         try
         {
-            MegaCrit.Sts2.Core.Commands.PotionCmd.Discard(existingPotion).GetAwaiter().GetResult();
+            RunWithTimeout(MegaCrit.Sts2.Core.Commands.PotionCmd.Discard(existingPotion), 3000, "PotionCmd.Discard belt");
             _syncCtx.Pump();
             Log($"Discarded belt potion: {existingPotion.Id.Entry} at slot {discardIdx}");
         }
@@ -1565,7 +1719,7 @@ public class RunSimulator
         var potionReward = _pendingPotionRewards[rewardIdx];
         try
         {
-            potionReward.OnSelectWrapper().GetAwaiter().GetResult();
+            RunWithTimeout(potionReward.OnSelectWrapper(), 5000, "PotionReward.OnSelectWrapper");
             _syncCtx.Pump();
             Log($"Collected potion reward: {potionReward.Potion?.Id.Entry}");
         }
@@ -1706,7 +1860,7 @@ public class RunSimulator
     private Dictionary<string, object?> DoLeaveRoom(Player player)
     {
         Log("Leaving room");
-        try { RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult(); }
+        try { RunWithTimeout(RunManager.Instance.ProceedFromTerminalRewardsScreen(), 5000, "ProceedFromTerminalRewardsScreen"); }
         catch { }
         _syncCtx.Pump();
         WaitForActionExecutor();
@@ -1718,7 +1872,7 @@ public class RunSimulator
             Log("Force leaving non-combat room to map");
             try
             {
-                RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult();
+                RunWithTimeout(RunManager.Instance.EnterRoom(new MapRoom()), 5000, "EnterRoom(MapRoom)");
                 _syncCtx.Pump();
                 WaitForActionExecutor();
             }
@@ -1768,7 +1922,7 @@ public class RunSimulator
             }
         }
 
-        RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
+        RunWithTimeout(RunManager.Instance.ProceedFromTerminalRewardsScreen(), 5000, "ProceedFromTerminalRewardsScreen");
         WaitForActionExecutor();
         return DetectDecisionPoint();
     }
@@ -1970,7 +2124,7 @@ public class RunSimulator
             Log("Map is null, generating...");
             try
             {
-                RunManager.Instance.GenerateMap().GetAwaiter().GetResult();
+                RunWithTimeout(RunManager.Instance.GenerateMap(), 5000, "GenerateMap");
                 _syncCtx.Pump();
                 map = _runState?.Map;
             }
@@ -2325,7 +2479,7 @@ public class RunSimulator
             try
             {
                 var rewardsSet = new RewardsSet(player).WithRewardsFromRoom(combatRoom);
-                var rewards = rewardsSet.GenerateWithoutOffering().GetAwaiter().GetResult();
+                var rewards = RunWithTimeout(rewardsSet.GenerateWithoutOffering(), 5000, "GenerateWithoutOffering");
                 _syncCtx.Pump();
 
                 // Auto-collect gold and relics, but present card and potion choices to agent
@@ -2335,7 +2489,7 @@ public class RunSimulator
                 {
                     if (reward is GoldReward || reward is MegaCrit.Sts2.Core.Rewards.RelicReward)
                     {
-                        try { reward.OnSelectWrapper().GetAwaiter().GetResult(); _syncCtx.Pump(); }
+                        try { RunWithTimeout(reward.OnSelectWrapper(), 3000, "Reward.OnSelectWrapper"); _syncCtx.Pump(); }
                         catch (Exception ex) { Log($"Auto-collect reward: {ex.Message}"); }
                     }
                     else if (reward is MegaCrit.Sts2.Core.Rewards.PotionReward pr)
@@ -2473,14 +2627,14 @@ public class RunSimulator
     {
         try
         {
-            RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
+            RunWithTimeout(RunManager.Instance.ProceedFromTerminalRewardsScreen(), 5000, "ProceedFromTerminalRewardsScreen");
             _syncCtx.Pump();
         }
         catch { }
 
         if (_runState?.CurrentRoom is not MapRoom)
         {
-            try { RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult(); _syncCtx.Pump(); }
+            try { RunWithTimeout(RunManager.Instance.EnterRoom(new MapRoom()), 5000, "EnterRoom(MapRoom)"); _syncCtx.Pump(); }
             catch (Exception ex) { Log($"ForceToMap: {ex.Message}"); }
         }
     }
@@ -2513,14 +2667,14 @@ public class RunSimulator
             Log($"Event {localEvent?.GetType().Name ?? "null"} finished, proceeding");
             try
             {
-                RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
+                RunWithTimeout(RunManager.Instance.ProceedFromTerminalRewardsScreen(), 5000, "ProceedFromTerminalRewardsScreen");
                 _syncCtx.Pump();
             }
             catch { }
             // Force to map if still in event room
             if (_runState?.CurrentRoom is EventRoom)
             {
-                try { RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult(); _syncCtx.Pump(); }
+                try { RunWithTimeout(RunManager.Instance.EnterRoom(new MapRoom()), 5000, "EnterRoom(MapRoom)"); _syncCtx.Pump(); }
                 catch { }
             }
             return _runState?.CurrentRoom is MapRoom ? MapSelectState() : DetectDecisionPoint();
@@ -2530,7 +2684,7 @@ public class RunSimulator
         if (currentOptions == null || currentOptions.Count == 0)
         {
             Log($"Event {localEvent.GetType().Name} has no options, auto-skipping");
-            try { RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult(); _syncCtx.Pump(); }
+            try { RunWithTimeout(RunManager.Instance.EnterRoom(new MapRoom()), 5000, "EnterRoom(MapRoom)"); _syncCtx.Pump(); }
             catch { }
             return MapSelectState();
         }
@@ -2890,9 +3044,9 @@ public class RunSimulator
                     _syncCtx.Pump();
                 }
 
-                treasureRoom.DoNormalRewards().GetAwaiter().GetResult();
+                RunWithTimeout(treasureRoom.DoNormalRewards(), 5000, "DoNormalRewards");
                 _syncCtx.Pump();
-                treasureRoom.DoExtraRewardsIfNeeded().GetAwaiter().GetResult();
+                RunWithTimeout(treasureRoom.DoExtraRewardsIfNeeded(), 5000, "DoExtraRewardsIfNeeded");
                 _syncCtx.Pump();
                 break; // Success — exit retry loop
             }
