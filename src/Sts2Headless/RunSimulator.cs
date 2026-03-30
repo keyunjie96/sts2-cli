@@ -334,7 +334,11 @@ internal class LocLookup
         if (smart != smartKey && !IsRawKey(smart))
         {
             smart = ResolvePowerTemplates(smart, amount);
-            return smart;
+            // If the smart description still has unresolved {Var:...} templates
+            // (e.g. {DamageIncrease:percentMore()} or {OwnerName}), fall back to
+            // the .description which has hardcoded values for those fields.
+            if (!smart.Contains('{'))
+                return smart;
         }
         // Fall back to .description (has hardcoded values but may still have template patterns)
         var result = Bilingual("powers", entry + ".description");
@@ -373,83 +377,405 @@ internal class LocLookup
     /// Handles SmartFormat patterns: energyIcons, plural, diff, cond, abs, singleStarIcon.</summary>
     internal static string ResolvePowerTemplates(string desc, int amount)
     {
-        // 1. Replace {Amount} (exact) with actual value early so later patterns can use it
-        desc = desc.Replace("{Amount}", amount.ToString());
+        var vars = new Dictionary<string, object?>(System.StringComparer.OrdinalIgnoreCase)
+        {
+            ["Amount"] = amount,
+        };
+        return ResolveDescriptionWithStats(desc, vars);
+    }
 
-        // 2. {Var:energyIcons(N)} or {energyPrefix:energyIcons(N)} → "N Energy"
-        desc = System.Text.RegularExpressions.Regex.Replace(desc,
-            @"\{\w+:energyIcons\((\d+)\)\}", m => m.Groups[1].Value + " Energy");
+    /// <summary>
+    /// Find the index of the closing '}' that matches an opening '{' at position openIdx,
+    /// correctly handling nested brace pairs. Returns -1 if not found.
+    /// </summary>
+    internal static int FindMatchingCloseBrace(string s, int openIdx)
+    {
+        int depth = 0;
+        for (int i = openIdx; i < s.Length; i++)
+        {
+            if (s[i] == '{') depth++;
+            else if (s[i] == '}') { depth--; if (depth == 0) return i; }
+        }
+        return -1;
+    }
 
-        // 3. {Var:energyIcons()} (empty parens) → use the variable's already-substituted value + " Energy"
-        //    If the variable was {Amount:energyIcons()} it's now "{<amount>:energyIcons()}" after step 1? No —
-        //    step 1 only replaced bare {Amount}. Handle by extracting the var name:
-        //    - If var name is a number (already substituted), use that number
-        //    - Otherwise treat it as "Energy"
-        desc = System.Text.RegularExpressions.Regex.Replace(desc,
-            @"\{(\w+):energyIcons\(\)\}", m =>
+    /// <summary>
+    /// Parse a top-level SmartFormat block starting at the '{' at position start.
+    /// Returns (varName, formatSpec, endIdx) where endIdx is the index of the matching '}'.
+    /// formatSpec is everything after the first ':' (if any), with balanced braces.
+    /// Returns null if the block can't be parsed.
+    /// </summary>
+    internal static (string varName, string? formatSpec, int endIdx)? ParseSmartBlock(string s, int start)
+    {
+        int end = FindMatchingCloseBrace(s, start);
+        if (end < 0) return null;
+        var inner = s.Substring(start + 1, end - start - 1);
+        // Split on first ':'
+        int colonIdx = -1;
+        int depth = 0;
+        for (int i = 0; i < inner.Length; i++)
+        {
+            if (inner[i] == '{') depth++;
+            else if (inner[i] == '}') depth--;
+            else if (inner[i] == ':' && depth == 0) { colonIdx = i; break; }
+        }
+        if (colonIdx < 0)
+            return (inner, null, end);
+        return (inner[..colonIdx], inner[(colonIdx + 1)..], end);
+    }
+
+    /// <summary>
+    /// Resolve all SmartFormat template patterns in a description using stat variable values.
+    /// Handles: {Var}, {Var:diff()}, {Var:abs()}, {Var:plural:singular|plural},
+    /// {Var:cond:condition?text|text}, {Var:energyIcons(N)}, {Var:starIcons()},
+    /// {singleStarIcon}, and nested patterns like {Var:plural:word|{Var:diff()} words}.
+    /// Strips BBCode and cleans up whitespace at the end.
+    /// </summary>
+    internal static string ResolveDescriptionWithStats(string desc, Dictionary<string, object?> vars)
+    {
+        // Multi-pass: resolve from innermost outward. Each pass resolves one layer
+        // of templates. Continue until no more changes (handles nesting like
+        // {Cards:plural:{IfUpgraded:show:X|Y}|{IfUpgraded:show:X|Y}}).
+        for (int pass = 0; pass < 5; pass++)
+        {
+            var result = new System.Text.StringBuilder(desc.Length);
+            int i = 0;
+            bool changed = false;
+            while (i < desc.Length)
             {
-                var varName = m.Groups[1].Value;
-                if (varName.Equals("Amount", System.StringComparison.OrdinalIgnoreCase))
-                    return amount + " Energy";
-                return varName + " Energy";
-            });
+                if (desc[i] != '{') { result.Append(desc[i]); i++; continue; }
 
-        // 4. {singleStarIcon} → "Star"
-        desc = desc.Replace("{singleStarIcon}", "Star");
+                var parsed = ParseSmartBlock(desc, i);
+                if (parsed == null) { result.Append(desc[i]); i++; continue; }
 
-        // 5. {Amount:diff()} → amount value (diff is a display formatter, just show the number)
-        desc = System.Text.RegularExpressions.Regex.Replace(desc,
-            @"\{Amount:diff\(\)\}", amount.ToString());
+                var (varName, fmt, endIdx) = parsed.Value;
+                string? resolved = ResolveOneTemplate(varName, fmt, vars);
+                if (resolved != null)
+                {
+                    result.Append(resolved);
+                    changed = true;
+                }
+                else
+                {
+                    // Can't resolve — leave intact for TUI to handle
+                    result.Append(desc, i, endIdx - i + 1);
+                }
+                i = endIdx + 1;
+            }
+            desc = result.ToString();
+            if (!changed) break;
+        }
 
-        // 6. {Amount:abs()} → absolute value
-        desc = System.Text.RegularExpressions.Regex.Replace(desc,
-            @"\{Amount:abs\(\)\}", Math.Abs(amount).ToString());
+        // Replace literal " X " with the first numeric var when X is a placeholder
+        int? firstAmount = null;
+        if (vars.TryGetValue("Amount", out var amtObj) && amtObj is int amt && amt != 0)
+            firstAmount = amt;
+        if (firstAmount != null)
+            desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\bX\b", firstAmount.Value.ToString());
 
-        // 7. {Amount:plural:singular|plural} → pick form based on amount
-        //    Also handles {Amount:plural:singular|[blue]{}[/blue] plural} where {} is replaced with amount
-        desc = System.Text.RegularExpressions.Regex.Replace(desc,
-            @"\{Amount:plural:([^|]*)\|([^}]*)\}", m =>
-            {
-                var singular = m.Groups[1].Value;
-                var plural = m.Groups[2].Value;
-                var form = (Math.Abs(amount) == 1) ? singular : plural;
-                // Replace {} inside the chosen form with the amount
-                form = form.Replace("{}", amount.ToString());
-                return form;
-            });
-
-        // 8. {Amount:cond:<0?negText|posText} → pick based on sign
-        desc = System.Text.RegularExpressions.Regex.Replace(desc,
-            @"\{Amount:cond:<0\?([^|]*)\|([^}]*)\}", m =>
-                amount < 0 ? m.Groups[1].Value : m.Groups[2].Value);
-        // {Amount:cond:==1?text1|>1?text2|} (multi-branch) → simplified handling
-        desc = System.Text.RegularExpressions.Regex.Replace(desc,
-            @"\{Amount:cond:==1\?\s*([^|]*)\|>1\?\s*([^|]*)\|[^}]*\}", m =>
-            {
-                var form = (amount == 1) ? m.Groups[1].Value : m.Groups[2].Value;
-                form = form.Replace("{}", amount.ToString());
-                return form;
-            });
-
-        // 9. {Var:diff()}, {Var:abs()}, {Var:percentLess()} for non-Amount vars → strip format, keep var name
-        //    These are stat vars that should have been resolved by DynamicVars; if still present, strip the format
-        desc = System.Text.RegularExpressions.Regex.Replace(desc,
-            @"\{(\w+):(?:diff|abs|percentLess|inverseDiff)\(\)\}", "{$1}");
-
-        // 10. Strip any remaining unresolved template variables like {Var:format}
-        //     (but not simple {Var} which might be meaningful stat names — strip those only if they look like templates)
-        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\{\w+:[^}]+\}", "");
-
-        // 11. Replace literal " X " with amount when X is a placeholder
-        if (amount != 0)
-            desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\bX\b", amount.ToString());
-
-        // 12. Strip BBCode
+        // Strip BBCode
         desc = StripBBCode(desc);
 
-        // 13. Clean up whitespace (double spaces from removed templates, leading/trailing)
+        // Clean up whitespace (double spaces from removed templates, leading/trailing)
         desc = System.Text.RegularExpressions.Regex.Replace(desc, @"  +", " ");
         return desc.Trim();
+    }
+
+    /// <summary>
+    /// Resolve a single template block {varName:formatSpec} given the available variables.
+    /// Returns the resolved string, or null if the template can't be resolved.
+    /// </summary>
+    internal static string? ResolveOneTemplate(string varName, string? fmt, Dictionary<string, object?> vars)
+    {
+        // {singleStarIcon} — no format
+        if (varName == "singleStarIcon" && fmt == null)
+            return "Star";
+
+        // {} — empty braces (value placeholder inside plural/cond forms)
+        // This should have been handled by the plural/cond resolver, but if it appears
+        // standalone, leave it as-is (will be cleaned up)
+        if (varName == "" && fmt == null)
+            return null;
+
+        // No format spec — just bare {Var}
+        if (fmt == null)
+        {
+            if (vars.TryGetValue(varName, out var val) && val != null)
+                return val.ToString();
+            return null; // unknown var — leave intact
+        }
+
+        // {Var:energyIcons(N)} → "N Energy"
+        var energyMatch = System.Text.RegularExpressions.Regex.Match(fmt, @"^energyIcons\((\d+)\)$");
+        if (energyMatch.Success)
+            return energyMatch.Groups[1].Value + " Energy";
+
+        // {Var:energyIcons()} → "value Energy" (use var value if available)
+        if (fmt == "energyIcons()")
+        {
+            if (vars.TryGetValue(varName, out var val) && val != null)
+                return val + " Energy";
+            return "Energy";
+        }
+
+        // {Var:starIcons()} → "value Star(s)" (use var value if available)
+        if (fmt == "starIcons()")
+        {
+            if (vars.TryGetValue(varName, out var val) && val is int sv)
+            {
+                if (sv == 1) return "1 Star";
+                return sv + " Stars";
+            }
+            return "Star";
+        }
+
+        // {Var:starIcons(N)} → "N Star(s)"
+        var starMatch = System.Text.RegularExpressions.Regex.Match(fmt, @"^starIcons\((\d+)\)$");
+        if (starMatch.Success)
+        {
+            var n = int.Parse(starMatch.Groups[1].Value);
+            return n == 1 ? "1 Star" : n + " Stars";
+        }
+
+        // Get the variable's integer value for format operations
+        int? intVal = null;
+        if (vars.TryGetValue(varName, out var varObj) && varObj is int iv)
+            intVal = iv;
+
+        // {Var:diff()} → just the number
+        if (fmt == "diff()")
+        {
+            if (intVal != null) return intVal.Value.ToString();
+            return null; // can't resolve without value
+        }
+
+        // {Var:abs()} → absolute value
+        if (fmt == "abs()")
+        {
+            if (intVal != null) return Math.Abs(intVal.Value).ToString();
+            return null;
+        }
+
+        // {Var:percentLess()} / {Var:inverseDiff()} — display formatters, just show value
+        if (fmt == "percentLess()" || fmt == "inverseDiff()")
+        {
+            if (intVal != null) return intVal.Value.ToString();
+            return null;
+        }
+
+        // {Var:plural:singular|plural} — pick form based on value
+        // The pipe inside plural content might itself contain nested braces that are already
+        // resolved (from inner passes), so we split on the FIRST top-level '|' after "plural:"
+        if (fmt.StartsWith("plural:"))
+        {
+            var content = fmt["plural:".Length..];
+            // Split on first top-level '|'
+            int pipeIdx = FindTopLevelPipe(content);
+            if (pipeIdx < 0) return null;
+            var singular = content[..pipeIdx];
+            var pluralForm = content[(pipeIdx + 1)..];
+            if (intVal != null)
+            {
+                var form = (Math.Abs(intVal.Value) == 1) ? singular : pluralForm;
+                // Replace {} inside the chosen form with the value
+                form = form.Replace("{}", intVal.Value.ToString());
+                return form;
+            }
+            return null; // can't resolve plural without value
+        }
+
+        // {Var:cond:condition} — conditional text
+        if (fmt.StartsWith("cond:"))
+        {
+            var content = fmt["cond:".Length..];
+            if (intVal != null)
+                return ResolveCondition(content, intVal.Value);
+            return null;
+        }
+
+        // {Var.StringValue:cond:...} — string-presence conditional (used for OwnerName etc.)
+        // These reference properties we can't resolve — leave intact
+        if (fmt.Contains(":cond:") && varName.Contains('.'))
+            return null;
+
+        // {IfUpgraded:show:trueText|falseText} — can't resolve here (needs card context)
+        if (varName == "IfUpgraded" || varName == "InCombat" || varName == "IsMultiplayer" ||
+            varName == "OnPlayer")
+            return null;
+
+        // Unknown format — can't resolve, leave intact
+        return null;
+    }
+
+    /// <summary>Find the index of the first top-level '|' in a string (not inside nested braces).</summary>
+    internal static int FindTopLevelPipe(string s)
+    {
+        int depth = 0;
+        for (int i = 0; i < s.Length; i++)
+        {
+            if (s[i] == '{') depth++;
+            else if (s[i] == '}') depth--;
+            else if (s[i] == '|' && depth == 0) return i;
+        }
+        return -1;
+    }
+
+    /// <summary>Resolve a SmartFormat cond expression like "&lt;0?negText|posText"
+    /// or "==1?text1|>1?text2|".</summary>
+    internal static string ResolveCondition(string condExpr, int value)
+    {
+        // Try simple two-branch: <0?negText|posText
+        var m2 = System.Text.RegularExpressions.Regex.Match(condExpr, @"^<0\?(.+)$");
+        if (m2.Success)
+        {
+            var rest = m2.Groups[1].Value;
+            int pipe = FindTopLevelPipe(rest);
+            if (pipe >= 0)
+            {
+                var negText = rest[..pipe];
+                var posText = rest[(pipe + 1)..];
+                return value < 0 ? negText : posText;
+            }
+        }
+
+        // Multi-branch: ==1?text1|>1?text2|default
+        // Parse branches separated by top-level '|'
+        var branches = SplitTopLevel(condExpr, '|');
+        foreach (var branch in branches)
+        {
+            var eqMatch = System.Text.RegularExpressions.Regex.Match(branch, @"^==(\d+)\?\s*(.*)$");
+            if (eqMatch.Success)
+            {
+                if (value == int.Parse(eqMatch.Groups[1].Value))
+                {
+                    var form = eqMatch.Groups[2].Value;
+                    return form.Replace("{}", value.ToString());
+                }
+                continue;
+            }
+            var gtMatch = System.Text.RegularExpressions.Regex.Match(branch, @"^>(\d+)\?\s*(.*)$");
+            if (gtMatch.Success)
+            {
+                if (value > int.Parse(gtMatch.Groups[1].Value))
+                {
+                    var form = gtMatch.Groups[2].Value;
+                    return form.Replace("{}", value.ToString());
+                }
+                continue;
+            }
+            var ltMatch = System.Text.RegularExpressions.Regex.Match(branch, @"^<(\d+)\?\s*(.*)$");
+            if (ltMatch.Success)
+            {
+                if (value < int.Parse(ltMatch.Groups[1].Value))
+                {
+                    var form = ltMatch.Groups[2].Value;
+                    return form.Replace("{}", value.ToString());
+                }
+                continue;
+            }
+            // Check for string-presence conditional like {ApplierName.StringValue:cond:trueText|falseText}
+            // If the branch starts with [ or other text (no condition prefix), treat as a conditional text
+            // that we can't evaluate — these involve OwnerName/ApplierName which are TUI-side concerns
+            if (!string.IsNullOrEmpty(branch) && !branch.Contains('?'))
+            {
+                // Default/fallback branch — use if no prior branch matched
+                return branch.Replace("{}", value.ToString());
+            }
+        }
+        // No branch matched — return the raw value
+        return value.ToString();
+    }
+
+    /// <summary>Split a string on a delimiter at the top level only (not inside nested braces).</summary>
+    internal static List<string> SplitTopLevel(string s, char delimiter)
+    {
+        var result = new List<string>();
+        int depth = 0;
+        int start = 0;
+        for (int i = 0; i < s.Length; i++)
+        {
+            if (s[i] == '{') depth++;
+            else if (s[i] == '}') depth--;
+            else if (s[i] == delimiter && depth == 0)
+            {
+                result.Add(s[start..i]);
+                start = i + 1;
+            }
+        }
+        result.Add(s[start..]);
+        return result;
+    }
+
+    /// <summary>
+    /// Resolve {VarName:trueText|falseText} patterns using balanced-brace-aware parsing.
+    /// Used for {InCombat:...} and {IsMultiplayer:...} context switches.
+    /// </summary>
+    internal static string ResolveContextBranch(string desc, string varName, bool condition)
+    {
+        var result = new System.Text.StringBuilder(desc.Length);
+        int i = 0;
+        while (i < desc.Length)
+        {
+            if (desc[i] != '{') { result.Append(desc[i]); i++; continue; }
+            var parsed = ParseSmartBlock(desc, i);
+            if (parsed == null || !parsed.Value.varName.Equals(varName, System.StringComparison.OrdinalIgnoreCase)
+                || parsed.Value.formatSpec == null)
+            {
+                result.Append(desc[i]); i++; continue;
+            }
+            var (_, fmt, endIdx) = parsed.Value;
+            // Split format on top-level '|'
+            int pipeIdx = FindTopLevelPipe(fmt!);
+            if (pipeIdx >= 0)
+            {
+                var trueText = fmt![..pipeIdx];
+                var falseText = fmt![(pipeIdx + 1)..];
+                result.Append(condition ? trueText : falseText);
+            }
+            else
+            {
+                // No pipe — show text if condition true, empty if false
+                result.Append(condition ? fmt : "");
+            }
+            i = endIdx + 1;
+        }
+        return result.ToString();
+    }
+
+    /// <summary>
+    /// Resolve {IfUpgraded:show:trueText|falseText} patterns using balanced-brace-aware parsing.
+    /// </summary>
+    internal static string ResolveIfUpgraded(string desc, bool isUpgraded)
+    {
+        var result = new System.Text.StringBuilder(desc.Length);
+        int i = 0;
+        while (i < desc.Length)
+        {
+            if (desc[i] != '{') { result.Append(desc[i]); i++; continue; }
+            var parsed = ParseSmartBlock(desc, i);
+            if (parsed == null || parsed.Value.varName != "IfUpgraded" || parsed.Value.formatSpec == null)
+            {
+                result.Append(desc[i]); i++; continue;
+            }
+            var (_, fmt, endIdx) = parsed.Value;
+            // Format is "show:trueText|falseText"
+            var content = fmt!;
+            if (content.StartsWith("show:"))
+                content = content["show:".Length..];
+            int pipeIdx = FindTopLevelPipe(content);
+            if (pipeIdx >= 0)
+            {
+                var trueText = content[..pipeIdx];
+                var falseText = content[(pipeIdx + 1)..];
+                result.Append(isUpgraded ? trueText : falseText);
+            }
+            else
+            {
+                result.Append(isUpgraded ? content : "");
+            }
+            i = endIdx + 1;
+        }
+        return result.ToString();
     }
 
     /// <summary>Resolve a full loc key like "TABLE.KEY.SUB" by searching all tables.</summary>
@@ -2083,18 +2409,10 @@ public class RunSimulator
                 {
                     var stats = new Dictionary<string, object?>();
                     try { foreach (var dv in card.DynamicVars.Values) stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
+                    var bundleVars = new Dictionary<string, object?>(System.StringComparer.OrdinalIgnoreCase);
+                    foreach (var kv in stats) if (kv.Value != null) bundleVars[kv.Key] = kv.Value;
                     var bundleCardDesc = _loc.Bilingual("cards", card.Id.Entry + ".description");
-                    if (stats.Count > 0 && bundleCardDesc.Contains('{'))
-                    {
-                        foreach (var kv in stats)
-                        {
-                            if (kv.Value != null)
-                                bundleCardDesc = System.Text.RegularExpressions.Regex.Replace(bundleCardDesc,
-                                    @"\{" + System.Text.RegularExpressions.Regex.Escape(kv.Key) + @"(?::[^}]*)?\}",
-                                    kv.Value.ToString() ?? "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                        }
-                    }
-                    bundleCardDesc = CleanupDescriptionTemplates(bundleCardDesc);
+                    bundleCardDesc = LocLookup.ResolveDescriptionWithStats(bundleCardDesc, bundleVars);
                     return new Dictionary<string, object?>
                     {
                         ["name"] = _loc.Card(card.Id.Entry),
@@ -3077,22 +3395,39 @@ public class RunSimulator
     private static string StripBBCode(string text) => LocLookup.StripBBCode(text);
 
     /// <summary>Clean up remaining template patterns in any description string:
-    /// energy icons, star icons, BBCode, and unresolved {Var:format} patterns.</summary>
+    /// energy icons, star icons, BBCode, and unresolved {Var:format} patterns.
+    /// Uses balanced-brace parsing to avoid partial matches on nested templates.</summary>
     private static string CleanupDescriptionTemplates(string desc)
     {
-        // {Var:energyIcons(N)} → "N Energy"
-        desc = System.Text.RegularExpressions.Regex.Replace(desc,
-            @"\{\w+:energyIcons\((\d+)\)\}", m => m.Groups[1].Value + " Energy");
-        // {Var:energyIcons()} → "Energy"
-        desc = System.Text.RegularExpressions.Regex.Replace(desc,
-            @"\{\w+:energyIcons\(\)\}", "Energy");
-        // {energyPrefix:energyIcons(N)} is already covered by the pattern above
-        // {singleStarIcon} → "Star"
-        desc = desc.Replace("{singleStarIcon}", "Star");
-        // Strip remaining {Var:format} patterns
-        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\{\w+:[^}]+\}", "");
-        // Strip BBCode
-        desc = StripBBCode(desc);
+        // Use ResolveDescriptionWithStats with empty vars — it will resolve
+        // energyIcons, starIcons, singleStarIcon, and strip BBCode properly.
+        // Any unresolvable templates (no var value) are left intact, then
+        // we strip them with balanced-brace-aware removal below.
+        desc = LocLookup.ResolveDescriptionWithStats(desc, new Dictionary<string, object?>(System.StringComparer.OrdinalIgnoreCase));
+
+        // Strip remaining unresolved {Var:format} patterns using balanced-brace parsing
+        var result = new System.Text.StringBuilder(desc.Length);
+        int i = 0;
+        while (i < desc.Length)
+        {
+            if (desc[i] != '{') { result.Append(desc[i]); i++; continue; }
+            var parsed = LocLookup.ParseSmartBlock(desc, i);
+            if (parsed == null) { result.Append(desc[i]); i++; continue; }
+            var (varName, fmt, endIdx) = parsed.Value;
+            if (fmt != null)
+            {
+                // Has a format spec — it's an unresolved template, strip it
+                i = endIdx + 1;
+            }
+            else
+            {
+                // Bare {Var} — leave it (might be meaningful)
+                result.Append(desc, i, endIdx - i + 1);
+                i = endIdx + 1;
+            }
+        }
+        desc = result.ToString();
+
         // Clean up whitespace
         desc = System.Text.RegularExpressions.Regex.Replace(desc, @"  +", " ");
         return desc.Trim();
@@ -3638,44 +3973,21 @@ public class RunSimulator
         var stats = new Dictionary<string, object?>();
         try { foreach (var dv in c.DynamicVars.Values.ToList()) stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
 
-        // Resolve card description with template substitution
+        // Resolve card description with template substitution using balanced-brace-aware parser
         var desc = _loc.Bilingual("cards", c.Id.Entry + ".description");
-        // Resolve {InCombat:trueText|falseText} — pick the appropriate branch
-        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\{InCombat:([^|]*)\|([^}]*)\}",
-            m => inCombat ? m.Groups[1].Value : m.Groups[2].Value);
-        // Resolve stat template variables like {Damage}, {Block}, {MagicNumber} using DynamicVars
-        if (stats.Count > 0 && desc.Contains('{'))
-        {
-            foreach (var kv in stats)
-            {
-                if (kv.Value != null)
-                {
-                    // Match case-insensitive: {Damage}, {damage}, {Block}, etc.
-                    desc = System.Text.RegularExpressions.Regex.Replace(desc,
-                        @"\{" + System.Text.RegularExpressions.Regex.Escape(kv.Key) + @"(?::[^}]*)?\}",
-                        kv.Value.ToString() ?? "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                }
-            }
-        }
-        // Resolve energy icons: {Var:energyIcons(N)} → "N Energy", {Var:energyIcons()} → "Energy"
-        if (desc.Contains("energyIcons"))
-        {
-            desc = System.Text.RegularExpressions.Regex.Replace(desc,
-                @"\{\w+:energyIcons\((\d+)\)\}", m => m.Groups[1].Value + " Energy");
-            desc = System.Text.RegularExpressions.Regex.Replace(desc,
-                @"\{\w+:energyIcons\(\)\}", "Energy");
-        }
-        // Resolve {singleStarIcon} → "Star"
-        desc = desc.Replace("{singleStarIcon}", "Star");
-        // Resolve {IfUpgraded:show:trueText|falseText} — pick branch based on upgrade status
-        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\{IfUpgraded:show:([^|]*)\|([^}]*)\}",
-            m => c.IsUpgraded ? m.Groups[1].Value : m.Groups[2].Value);
-        // Strip remaining unresolved {Var:format} templates (but keep simple {Var})
-        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\{\w+:[^}]+\}", "");
-        // Strip remaining BBCode tags
-        desc = StripBBCode(desc);
-        // Clean up double spaces from removed templates
-        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"  +", " ").Trim();
+        // Build vars dict from stats (case-insensitive) plus special context vars
+        var descVars = new Dictionary<string, object?>(System.StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in stats)
+            if (kv.Value != null) descVars[kv.Key] = kv.Value;
+        // Add context-specific pseudo-variables for InCombat and IfUpgraded
+        descVars["InCombat"] = inCombat;
+        descVars["IfUpgraded"] = c.IsUpgraded;
+        // Pre-resolve {InCombat:trueText|falseText} using balanced braces
+        desc = LocLookup.ResolveContextBranch(desc, "InCombat", inCombat);
+        // Pre-resolve {IfUpgraded:show:trueText|falseText} using balanced braces
+        desc = LocLookup.ResolveIfUpgraded(desc, c.IsUpgraded);
+        // Now resolve all SmartFormat templates with stat values
+        desc = LocLookup.ResolveDescriptionWithStats(desc, descVars);
 
         var cardInfo = new Dictionary<string, object?>
         {
@@ -3752,19 +4064,12 @@ public class RunSimulator
             var addedKws = newKws.Except(oldKws).ToList();
             var removedKws = oldKws.Except(newKws).ToList();
 
-            // Resolve upgraded description templates
+            // Resolve upgraded description templates using balanced-brace-aware parser
+            var upgVars = new Dictionary<string, object?>(System.StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in stats) if (kv.Value != null) upgVars[kv.Key] = kv.Value;
             var upgDesc = _loc.Bilingual("cards", card.Id.Entry + ".description");
-            if (stats.Count > 0 && upgDesc.Contains('{'))
-            {
-                foreach (var kv in stats)
-                {
-                    if (kv.Value != null)
-                        upgDesc = System.Text.RegularExpressions.Regex.Replace(upgDesc,
-                            @"\{" + System.Text.RegularExpressions.Regex.Escape(kv.Key) + @"(?::[^}]*)?\}",
-                            kv.Value.ToString() ?? "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                }
-            }
-            upgDesc = CleanupDescriptionTemplates(upgDesc);
+            upgDesc = LocLookup.ResolveIfUpgraded(upgDesc, true); // upgraded card
+            upgDesc = LocLookup.ResolveDescriptionWithStats(upgDesc, upgVars);
 
             return new Dictionary<string, object?>
             {
@@ -3796,19 +4101,11 @@ public class RunSimulator
                 // Derive counter: use the first DynamicVar value if any, else -1 (no counter)
                 int counter = -1;
                 try { if (vars.Count > 0) counter = (int)(vars.Values.First() ?? -1); } catch { }
-                // Resolve relic description templates
+                // Resolve relic description templates using balanced-brace-aware parser
+                var relicVars = new Dictionary<string, object?>(System.StringComparer.OrdinalIgnoreCase);
+                foreach (var kv in vars) if (kv.Value != null) relicVars[kv.Key] = kv.Value;
                 var relicDesc = _loc.Bilingual("relics", r.Id.Entry + ".description");
-                if (vars.Count > 0 && relicDesc.Contains('{'))
-                {
-                    foreach (var kv in vars)
-                    {
-                        if (kv.Value != null)
-                            relicDesc = System.Text.RegularExpressions.Regex.Replace(relicDesc,
-                                @"\{" + System.Text.RegularExpressions.Regex.Escape(kv.Key) + @"(?::[^}]*)?\}",
-                                kv.Value.ToString() ?? "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                    }
-                }
-                relicDesc = CleanupDescriptionTemplates(relicDesc);
+                relicDesc = LocLookup.ResolveDescriptionWithStats(relicDesc, relicVars);
                 return new Dictionary<string, object?>
                 {
                     ["id"] = r.Id.Entry,
@@ -3823,19 +4120,11 @@ public class RunSimulator
                 if (p == null) return null;
                 var pvars = new Dictionary<string, object?>();
                 try { foreach (var dv in p.DynamicVars.Values.ToList()) pvars[dv.Name] = (int)dv.BaseValue; } catch { }
-                // Resolve potion description templates
+                // Resolve potion description templates using balanced-brace-aware parser
+                var potVars = new Dictionary<string, object?>(System.StringComparer.OrdinalIgnoreCase);
+                foreach (var kv in pvars) if (kv.Value != null) potVars[kv.Key] = kv.Value;
                 var potDesc = _loc.Bilingual("potions", p.Id.Entry + ".description");
-                if (pvars.Count > 0 && potDesc.Contains('{'))
-                {
-                    foreach (var kv in pvars)
-                    {
-                        if (kv.Value != null)
-                            potDesc = System.Text.RegularExpressions.Regex.Replace(potDesc,
-                                @"\{" + System.Text.RegularExpressions.Regex.Escape(kv.Key) + @"(?::[^}]*)?\}",
-                                kv.Value.ToString() ?? "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                    }
-                }
-                potDesc = CleanupDescriptionTemplates(potDesc);
+                potDesc = LocLookup.ResolveDescriptionWithStats(potDesc, potVars);
                 return new Dictionary<string, object?>
                 {
                     ["index"] = i,
@@ -3851,19 +4140,12 @@ public class RunSimulator
                 var dstats = new Dictionary<string, object?>();
                 try { foreach (var dv in c.DynamicVars.Values.ToList()) dstats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
                 var dkws = c.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToList();
-                // Resolve deck card description templates
+                // Resolve deck card description templates using balanced-brace-aware parser
+                var deckVars = new Dictionary<string, object?>(System.StringComparer.OrdinalIgnoreCase);
+                foreach (var kv in dstats) if (kv.Value != null) deckVars[kv.Key] = kv.Value;
                 var deckCardDesc = _loc.Bilingual("cards", c.Id.Entry + ".description");
-                if (dstats.Count > 0 && deckCardDesc.Contains('{'))
-                {
-                    foreach (var kv in dstats)
-                    {
-                        if (kv.Value != null)
-                            deckCardDesc = System.Text.RegularExpressions.Regex.Replace(deckCardDesc,
-                                @"\{" + System.Text.RegularExpressions.Regex.Escape(kv.Key) + @"(?::[^}]*)?\}",
-                                kv.Value.ToString() ?? "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-                    }
-                }
-                deckCardDesc = CleanupDescriptionTemplates(deckCardDesc);
+                deckCardDesc = LocLookup.ResolveIfUpgraded(deckCardDesc, c.IsUpgraded);
+                deckCardDesc = LocLookup.ResolveDescriptionWithStats(deckCardDesc, deckVars);
                 return new Dictionary<string, object?>
                 {
                     ["id"] = c.Id.ToString(),
