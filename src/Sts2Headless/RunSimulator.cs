@@ -1787,11 +1787,18 @@ public class RunSimulator
         if (idx < 0 || idx >= _pendingPotionRewards.Count)
             return Error($"Invalid potion reward index {idx}, {_pendingPotionRewards.Count} available");
 
-        // Check if potion belt has space
+        // Check if potion belt has space — if full, auto-skip this reward
+        // to advance state. Returning an error here caused agents to loop
+        // infinitely: error → proceed → same card_reward → collect → error …
         var potionsList = player.Potions?.ToList() ?? new();
         var hasSpace = potionsList.Any(p => p == null);
         if (!hasSpace)
-            return Error("Potion belt is full. Use 'discard_potion_for_reward' to make room first, or 'skip_potion_reward' to skip.");
+        {
+            Log($"Potion belt full, auto-skipping potion reward at index {idx}");
+            _pendingPotionRewards.RemoveAt(idx);
+            if (_pendingPotionRewards.Count == 0) _pendingPotionRewards = null;
+            return DetectDecisionPoint();
+        }
 
         var potionReward = _pendingPotionRewards[idx];
         try
