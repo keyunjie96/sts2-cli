@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
 using MegaCrit.Sts2.Core.Combat;
@@ -40,8 +41,8 @@ namespace Sts2Headless;
 /// </summary>
 internal class InlineSynchronizationContext : SynchronizationContext
 {
-    private readonly Queue<(SendOrPostCallback, object?)> _queue = new();
-    private bool _executing;
+    private readonly ConcurrentQueue<(SendOrPostCallback, object?)> _queue = new();
+    private volatile bool _executing;
 
     /// <summary>
     /// Safety limit: if the queue grows beyond this during a single drain cycle,
@@ -85,6 +86,12 @@ internal class InlineSynchronizationContext : SynchronizationContext
         Exception? cbException = null;
         ThreadPool.QueueUserWorkItem(_ =>
         {
+            // Set our sync context on this ThreadPool thread so that async
+            // continuations from game code (especially async-void on-death
+            // callbacks like Minion power effects) are posted to our queue
+            // instead of running unhandled on the ThreadPool — which would
+            // crash the process with an unobserved exception.
+            SynchronizationContext.SetSynchronizationContext(this);
             try { d(state); }
             catch (Exception ex) { cbException = ex; }
             finally { done.Set(); }
@@ -106,9 +113,9 @@ internal class InlineSynchronizationContext : SynchronizationContext
             // These are typically async continuations that the main callback is
             // waiting on — executing them here breaks the deadlock.
             int innerDrained = 0;
-            while (_queue.Count > 0 && innerDrained < 100 && !done.IsSet)
+            while (innerDrained < 100 && !done.IsSet && _queue.TryDequeue(out var item))
             {
-                var (cb, st) = _queue.Dequeue();
+                var (cb, st) = item;
                 try
                 {
                     cb(st); // Execute inline on THIS thread — safe because _executing is true
@@ -153,9 +160,9 @@ internal class InlineSynchronizationContext : SynchronizationContext
             }
             // Drain any remaining callbacks that were queued during execution
             int drained = 0;
-            while (_queue.Count > 0 && drained < MaxDrainPerCycle)
+            while (drained < MaxDrainPerCycle && _queue.TryDequeue(out var postItem))
             {
-                var (cb, st) = _queue.Dequeue();
+                var (cb, st) = postItem;
                 try
                 {
                     if (!RunCallbackWithDrain(cb, st, DefaultPumpCallbackTimeoutMs, "Post.drain"))
@@ -167,7 +174,7 @@ internal class InlineSynchronizationContext : SynchronizationContext
                 }
                 drained++;
             }
-            if (_queue.Count > 0)
+            if (!_queue.IsEmpty)
                 Console.Error.WriteLine($"[WARN] SyncCtx.Post drain hit limit ({MaxDrainPerCycle}), {_queue.Count} callbacks remaining");
         }
         catch (Exception ex)
@@ -198,9 +205,9 @@ internal class InlineSynchronizationContext : SynchronizationContext
         // drain the queue while waiting, preventing the classic deadlock where a
         // callback's async continuation is stuck in our queue.
         int drained = 0;
-        while (_queue.Count > 0 && drained < MaxDrainPerCycle)
+        while (drained < MaxDrainPerCycle && _queue.TryDequeue(out var pumpItem))
         {
-            var (cb, st) = _queue.Dequeue();
+            var (cb, st) = pumpItem;
             _executing = true;
             try
             {
@@ -220,7 +227,7 @@ internal class InlineSynchronizationContext : SynchronizationContext
             }
             drained++;
         }
-        if (_queue.Count > 0)
+        if (!_queue.IsEmpty)
             Console.Error.WriteLine($"[WARN] SyncCtx.Pump hit limit ({MaxDrainPerCycle}), {_queue.Count} callbacks remaining");
     }
 
@@ -233,9 +240,9 @@ internal class InlineSynchronizationContext : SynchronizationContext
     {
         int drained = 0;
         bool timedOut = false;
-        while (_queue.Count > 0 && drained < MaxDrainPerCycle)
+        while (drained < MaxDrainPerCycle && _queue.TryDequeue(out var pwtItem))
         {
-            var (cb, st) = _queue.Dequeue();
+            var (cb, st) = pwtItem;
             _executing = true;
             try
             {
@@ -1543,12 +1550,20 @@ public class RunSimulator
             _syncCtx.PumpWithTimeout(perCallbackTimeoutMs: 1000);
         }
 
+        // If combat ended (e.g., killing a boss minion ended the fight), skip
+        // the hand-unchanged check and go straight to decision point detection.
+        if (!CombatManager.Instance.IsInProgress || (player.Creature != null && player.Creature.IsDead))
+        {
+            Log("DoPlayCard: combat ended or player died during card play");
+            return DetectDecisionPoint();
+        }
+
         // Hard timeout: if play_card has taken more than 10s total, force-recover
         if (playCardTimer.ElapsedMilliseconds > 10_000)
         {
             Log($"DoPlayCard HARD TIMEOUT after {playCardTimer.ElapsedMilliseconds}ms");
             // If combat is somehow stuck, don't hang — just return current state
-            if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead)
+            if (!CombatManager.Instance.IsInProgress || (player.Creature != null && player.Creature.IsDead))
             {
                 return DetectDecisionPoint();
             }
@@ -1556,8 +1571,9 @@ public class RunSimulator
         }
 
         // Check if card play had no effect (hand unchanged, same card still at same index)
-        var handAfter = pcs.Hand.Cards;
-        if (handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card)
+        // Guard against null pcs/Hand in case combat state was torn down
+        var handAfter = pcs?.Hand?.Cards;
+        if (handAfter != null && handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card)
         {
             return Error($"Card could not be played (still in hand after action): {card.GetType().Name} [{card.Id}]");
         }
