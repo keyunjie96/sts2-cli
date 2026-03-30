@@ -850,13 +850,14 @@ public class RunSimulator
 
             var player = _runState.Players[0];
 
-            // God mode: set HP to 9999 so burst damage can't kill
+            // God mode: set HP high enough to survive any hit but not so high
+            // that fights last hundreds of turns and OOM the engine
             if (GodMode && player.Creature != null)
             {
                 try
                 {
-                    SetField(player.Creature, "_currentHp", 9999);
-                    SetField(player.Creature, "_maxHp", 9999);
+                    SetField(player.Creature, "_currentHp", 500);
+                    SetField(player.Creature, "_maxHp", 500);
                 }
                 catch { }
             }
