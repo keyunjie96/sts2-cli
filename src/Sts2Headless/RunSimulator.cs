@@ -467,6 +467,14 @@ internal class LocLookup
                 string? resolved = ResolveOneTemplate(varName, fmt, vars);
                 if (resolved != null)
                 {
+                    // Fix "0Energy" concatenation: when a template like
+                    // {energyPrefix:energyIcons(1)} resolves to "Energy" and directly
+                    // follows a digit (no space), insert a space to get "0 Energy".
+                    if (result.Length > 0 && char.IsDigit(result[result.Length - 1])
+                        && resolved.Length > 0 && char.IsLetter(resolved[0]))
+                    {
+                        result.Append(' ');
+                    }
                     result.Append(resolved);
                     changed = true;
                 }
@@ -520,10 +528,16 @@ internal class LocLookup
             return null; // unknown var — leave intact
         }
 
-        // {Var:energyIcons(N)} → "N Energy"
+        // {Var:energyIcons(N)} — render N energy icons as text.
+        // N=1: just the energy symbol → "Energy" (the preceding text supplies the number
+        //       when relevant, e.g. "0{var:energyIcons(1)}" → "0 Energy").
+        // N>1: the icon count IS the amount → "N Energy" (e.g. energyIcons(4) → "4 Energy").
         var energyMatch = System.Text.RegularExpressions.Regex.Match(fmt, @"^energyIcons\((\d+)\)$");
         if (energyMatch.Success)
-            return energyMatch.Groups[1].Value + " Energy";
+        {
+            int n = int.Parse(energyMatch.Groups[1].Value);
+            return n <= 1 ? "Energy" : n + " Energy";
+        }
 
         // {Var:energyIcons()} → "value Energy" (use var value if available)
         if (fmt == "energyIcons()")
@@ -688,12 +702,12 @@ internal class LocLookup
                 }
                 continue;
             }
-            // Check for string-presence conditional like {ApplierName.StringValue:cond:trueText|falseText}
-            // If the branch starts with [ or other text (no condition prefix), treat as a conditional text
-            // that we can't evaluate — these involve OwnerName/ApplierName which are TUI-side concerns
-            if (!string.IsNullOrEmpty(branch) && !branch.Contains('?'))
+            // Default/fallback branch — no condition prefix, just text (or empty string).
+            // An empty default is valid: e.g. ">0? to ALL enemies|" means "nothing when ≤ 0".
+            // String-presence conditionals (OwnerName.StringValue:cond:...) can't be evaluated
+            // here, but if we've exhausted all branches, this is the fallback.
+            if (!branch.Contains('?'))
             {
-                // Default/fallback branch — use if no prior branch matched
                 return branch.Replace("{}", value.ToString());
             }
         }
@@ -3356,6 +3370,12 @@ public class RunSimulator
                     }
                 }
                 title ??= $"option_{i}";
+                // Resolve SmartFormat patterns in title with event vars
+                if (title != null && title.Contains('{') && resolvedEventVars.Count > 0)
+                {
+                    var ciVars = new Dictionary<string, object?>(resolvedEventVars, System.StringComparer.OrdinalIgnoreCase);
+                    title = LocLookup.ResolveDescriptionWithStats(title, ciVars);
+                }
                 // Clean up any remaining templates/BBCode in title
                 if (title != null && (title.Contains('{') || title.Contains('[')))
                     title = CleanupDescriptionTemplates(title);
@@ -3394,6 +3414,13 @@ public class RunSimulator
                 // (e.g. "Add CLUMSY.title to your Deck" -> "Add Clumsy to your Deck")
                 if (optDesc != null)
                     optDesc = _loc.ResolveInlineLocKeys(optDesc);
+                // Resolve SmartFormat patterns (plural, cond, energyIcons, etc.)
+                // with the actual event vars before cleanup strips unresolved templates
+                if (optDesc != null && resolvedEventVars.Count > 0)
+                {
+                    var ciVars = new Dictionary<string, object?>(resolvedEventVars, System.StringComparer.OrdinalIgnoreCase);
+                    optDesc = LocLookup.ResolveDescriptionWithStats(optDesc, ciVars);
+                }
                 // Clean up remaining templates: energy icons, BBCode, {Var:format} patterns
                 if (optDesc != null)
                     optDesc = CleanupDescriptionTemplates(optDesc);
@@ -3460,6 +3487,13 @@ public class RunSimulator
         // Resolve literal localization keys in event description
         if (eventDesc != null)
             eventDesc = _loc.ResolveInlineLocKeys(eventDesc);
+        // Resolve SmartFormat patterns (plural, cond, energyIcons, etc.)
+        // with the actual event vars before cleanup strips unresolved templates
+        if (eventDesc != null && resolvedEventVars.Count > 0)
+        {
+            var ciVars = new Dictionary<string, object?>(resolvedEventVars, System.StringComparer.OrdinalIgnoreCase);
+            eventDesc = LocLookup.ResolveDescriptionWithStats(eventDesc, ciVars);
+        }
         // Clean up remaining templates: energy icons, BBCode, {Var:format} patterns
         if (eventDesc != null)
             eventDesc = CleanupDescriptionTemplates(eventDesc);
@@ -3498,15 +3532,19 @@ public class RunSimulator
     }
 
     /// <summary>
-    /// Simple template variable substitution: replaces {VarName} placeholders
-    /// in a localization string with resolved values. Also handles SmartFormat
-    /// extensions like {Var:plural:...} by stripping the format suffix.
+    /// Simple template variable substitution: replaces bare {VarName} placeholders
+    /// in a localization string with resolved values. Does NOT touch SmartFormat
+    /// patterns like {Var:plural:...}, {Var:energyIcons(...)}, {Var:cond:...} etc.
+    /// — those are left for ResolveDescriptionWithStats to handle properly.
     /// </summary>
     private static string SubstituteVars(string template, Dictionary<string, object?> vars)
     {
         if (vars.Count == 0 || !template.Contains('{'))
             return template;
-        return System.Text.RegularExpressions.Regex.Replace(template, @"\{(\w+)(?::[^}]*)?\}", m =>
+        // Only match bare {VarName} — NOT {VarName:format}.
+        // Patterns with format specs (plural, cond, energyIcons, etc.) must be
+        // resolved by ResolveDescriptionWithStats which understands SmartFormat.
+        return System.Text.RegularExpressions.Regex.Replace(template, @"\{(\w+)\}", m =>
         {
             var key = m.Groups[1].Value;
             if (vars.TryGetValue(key, out var val) && val != null)
