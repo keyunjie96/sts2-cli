@@ -245,12 +245,72 @@ internal class LocLookup
 
     // Convenience helpers using ModelId
     public string Card(string entry) => Bilingual("cards", entry + ".title");
-    public string Monster(string entry) => Bilingual("monsters", entry + ".name");
+    public string Monster(string entry)
+    {
+        var result = Bilingual("monsters", entry + ".name");
+        if (IsRawKey(result))
+            return HumanizeId(entry);
+        return result;
+    }
     public string Relic(string entry) => Bilingual("relics", entry + ".title");
     public string Potion(string entry) => Bilingual("potions", entry + ".title");
-    public string Power(string entry) => Bilingual("powers", entry + ".title");
+    public string Power(string entry)
+    {
+        var result = Bilingual("powers", entry + ".title");
+        if (IsRawKey(result))
+            return HumanizeId(entry.EndsWith("_POWER") ? entry[..^6] : entry);
+        return result;
+    }
+    public string PowerDescription(string entry, int amount)
+    {
+        var result = Bilingual("powers", entry + ".description");
+        if (!IsRawKey(result))
+        {
+            result = ResolvePowerTemplates(result, amount);
+            return result;
+        }
+        // Fallback: construct basic description from amount
+        var name = Power(entry);
+        if (amount != 0) return $"{name}: {amount}";
+        return name;
+    }
     public string Event(string entry) => Bilingual("events", entry + ".title");
     public string Act(string entry) => Bilingual("acts", entry + ".title");
+
+    /// <summary>Check if a localization result is still a raw/unresolved key.</summary>
+    private static bool IsRawKey(string result)
+    {
+        return result.Contains(".title") || result.Contains(".name") || result.Contains(".description");
+    }
+
+    /// <summary>Convert a raw ID like "SYNCHRONIZE_POWER" to "Synchronize".</summary>
+    internal static string HumanizeId(string id)
+    {
+        // Strip common suffixes
+        if (id.EndsWith("_POWER")) id = id[..^6];
+        if (id.EndsWith("_BOSS")) id = id[..^5];
+        // Title-case: split on underscores, capitalize first letter of each word
+        return string.Join(" ", id.Split('_')
+            .Where(s => s.Length > 0)
+            .Select(s => char.ToUpper(s[0]) + s[1..].ToLower()));
+    }
+
+    /// <summary>Resolve power description templates like {Amount}, {energyPrefix:energyIcons(N)}, and strip BBCode.</summary>
+    internal static string ResolvePowerTemplates(string desc, int amount)
+    {
+        // Replace {Amount} with actual value
+        desc = desc.Replace("{Amount}", amount.ToString());
+        // Replace {energyPrefix:energyIcons(N)} with "N Energy"
+        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\{energyPrefix:energyIcons\((\d+)\)\}", m => m.Groups[1].Value + " Energy");
+        // Strip any remaining unresolved template variables like {Var:format}
+        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\{\w+(?::[^}]*)?\}", "");
+        // Replace literal " X " with amount when X is a placeholder
+        if (amount != 0)
+            desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\bX\b", amount.ToString());
+        // Strip BBCode
+        desc = StripBBCode(desc);
+        return desc.Trim();
+    }
 
     /// <summary>Resolve a full loc key like "TABLE.KEY.SUB" by searching all tables.</summary>
     public string BilingualFromKey(string locKey)
@@ -2011,7 +2071,7 @@ public class RunSimulator
         // Snapshot hand cards to avoid "Collection was modified" during enumeration
         var hand = pcs?.Hand?.Cards?.ToList().Select((c, i) =>
         {
-            var cardInfo = SerializeCard(c, i);
+            var cardInfo = SerializeCard(c, i, inCombat: true);
             // Combat-specific fields
             cardInfo["can_play"] = c.CanPlay(out _, out _);
             cardInfo["target_type"] = c.TargetType.ToString();
@@ -2065,7 +2125,7 @@ public class RunSimulator
                 var ePowers = e.Powers?.Select(pw => new Dictionary<string, object?>
                 {
                     ["name"] = _loc.Power(pw.Id.Entry),
-                    ["description"] = _loc.Bilingual("powers", pw.Id.Entry + ".description"),
+                    ["description"] = _loc.PowerDescription(pw.Id.Entry, pw.Amount),
                     ["amount"] = pw.Amount,
                 }).ToList();
 
@@ -2086,7 +2146,7 @@ public class RunSimulator
         var playerPowers = player.Creature?.Powers?.Select(pw => new Dictionary<string, object?>
         {
             ["name"] = _loc.Power(pw.Id.Entry),
-            ["description"] = _loc.Bilingual("powers", pw.Id.Entry + ".description"),
+            ["description"] = _loc.PowerDescription(pw.Id.Entry, pw.Amount),
             ["amount"] = pw.Amount,
         }).ToList();
 
@@ -2105,10 +2165,26 @@ public class RunSimulator
                 {
                     var c = handCards[hi];
                     var cardInfo = hand[hi];
-                    // Only compute for attack cards with damage stat
-                    if (c.Type == CardType.Attack && c.DynamicVars.Values.ToList().Any(dv => dv.Name.Equals("Damage", StringComparison.OrdinalIgnoreCase)))
+                    // Only compute for attack cards with a damage-like stat
+                    var dvList = c.DynamicVars.Values.ToList();
+                    int baseDmg = 0;
+                    bool hasDamage = false;
+                    // Check for standard "Damage" stat first
+                    var damageDv = dvList.FirstOrDefault(dv => dv.Name.Equals("Damage", StringComparison.OrdinalIgnoreCase));
+                    if (damageDv != null) { baseDmg = (int)damageDv.BaseValue; hasDamage = true; }
+                    // Also check for ostydamage and calculateddamage stat keys
+                    if (!hasDamage)
                     {
-                        int baseDmg = (int)c.DynamicVars.Damage.BaseValue;
+                        var ostyDv = dvList.FirstOrDefault(dv => dv.Name.Equals("OstyDamage", StringComparison.OrdinalIgnoreCase));
+                        if (ostyDv != null) { baseDmg = (int)ostyDv.BaseValue; hasDamage = true; }
+                    }
+                    if (!hasDamage)
+                    {
+                        var calcDv = dvList.FirstOrDefault(dv => dv.Name.Equals("CalculatedDamage", StringComparison.OrdinalIgnoreCase));
+                        if (calcDv != null) { baseDmg = (int)calcDv.BaseValue; hasDamage = true; }
+                    }
+                    if (c.Type == CardType.Attack && hasDamage)
+                    {
                         var effectiveDamages = enemyCreatures.Select(enemy =>
                         {
                             var enemyPowers = enemy.Powers?.ToList();
@@ -3178,10 +3254,32 @@ public class RunSimulator
     /// Context-specific fields (can_play, target_type, cost/gold, is_stocked, on_sale)
     /// should be added by the caller after invoking this method.
     /// </summary>
-    private Dictionary<string, object?> SerializeCard(CardModel c, int index)
+    private Dictionary<string, object?> SerializeCard(CardModel c, int index, bool inCombat = false)
     {
         var stats = new Dictionary<string, object?>();
         try { foreach (var dv in c.DynamicVars.Values.ToList()) stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
+
+        // Resolve card description with template substitution
+        var desc = _loc.Bilingual("cards", c.Id.Entry + ".description");
+        // Resolve {InCombat:trueText|falseText} — pick the appropriate branch
+        desc = System.Text.RegularExpressions.Regex.Replace(desc, @"\{InCombat:([^|]*)\|([^}]*)\}",
+            m => inCombat ? m.Groups[1].Value : m.Groups[2].Value);
+        // Resolve stat template variables like {Damage}, {Block}, {MagicNumber} using DynamicVars
+        if (stats.Count > 0 && desc.Contains('{'))
+        {
+            foreach (var kv in stats)
+            {
+                if (kv.Value != null)
+                {
+                    // Match case-insensitive: {Damage}, {damage}, {Block}, etc.
+                    desc = System.Text.RegularExpressions.Regex.Replace(desc,
+                        @"\{" + System.Text.RegularExpressions.Regex.Escape(kv.Key) + @"(?::[^}]*)?\}",
+                        kv.Value.ToString() ?? "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                }
+            }
+        }
+        // Strip remaining BBCode tags
+        desc = StripBBCode(desc);
 
         var cardInfo = new Dictionary<string, object?>
         {
@@ -3192,7 +3290,7 @@ public class RunSimulator
             ["type"] = c.Type.ToString(),
             ["rarity"] = c.Rarity.ToString(),
             ["upgraded"] = c.IsUpgraded,
-            ["description"] = _loc.Bilingual("cards", c.Id.Entry + ".description"),
+            ["description"] = desc,
             ["stats"] = stats.Count > 0 ? stats : null,
             ["after_upgrade"] = GetUpgradedInfo(c),
         };
