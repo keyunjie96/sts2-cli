@@ -1142,6 +1142,13 @@ public class RunSimulator
             _pendingCardReward.OnSkipped();
             _pendingCardReward = null;
         }
+        // If no cards left but potion rewards remain, also skip those
+        // to prevent stuck state (empty cards[] card_reward that can't advance)
+        if (_pendingCardReward == null && _pendingPotionRewards != null && _pendingPotionRewards.Count > 0)
+        {
+            Log("Skipping remaining potion rewards (no card reward pending)");
+            _pendingPotionRewards = null;
+        }
         return DetectDecisionPoint();
     }
 
