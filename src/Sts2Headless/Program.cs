@@ -19,6 +19,15 @@ class Program
 
     static int Main(string[] args)
     {
+        // ── Thread pool sizing ──────────────────────────────────────────
+        // RunCallbackWithDrain dispatches callbacks to the ThreadPool. When a callback
+        // times out, the ThreadPool thread it runs on remains occupied until the callback
+        // naturally completes (we can't kill it). Over many timeouts, this can exhaust
+        // the pool and cause new callbacks to queue behind stuck ones, manifesting as
+        // hangs. Setting a higher minimum prevents the pool from throttling thread creation
+        // when demand spikes from accumulated abandoned callbacks.
+        ThreadPool.SetMinThreads(32, 32);
+
         // ── Global crash prevention ──────────────────────────────────────
         // AppDomain.UnhandledException fires *after* the runtime decides to
         // terminate, so we can only log — but at least we leave a trace.

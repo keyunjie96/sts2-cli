@@ -49,6 +49,21 @@ internal class InlineSynchronizationContext : SynchronizationContext
     /// </summary>
     private const int MaxDrainPerCycle = 10_000;
 
+    /// <summary>Number of queued callbacks (for diagnostic logging).</summary>
+    public int QueueCount => _queue.Count;
+
+    /// <summary>
+    /// Discard all queued callbacks. Used to prevent unbounded memory growth
+    /// during long god-mode combats where abandoned callbacks accumulate.
+    /// </summary>
+    public void ClearQueue()
+    {
+        int cleared = _queue.Count;
+        _queue.Clear();
+        if (cleared > 0)
+            Console.Error.WriteLine($"[INFO] SyncCtx.ClearQueue: discarded {cleared} queued callbacks");
+    }
+
     /// <summary>
     /// Default per-callback timeout. Any single callback that takes longer
     /// than this is abandoned (the thread it runs on cannot be killed, but we stop waiting).
@@ -867,6 +882,19 @@ public class RunSimulator
     private bool _shopCardRemoved;
 
     /// <summary>
+    /// Combat turn counter — incremented every end_turn, reset when entering a new room.
+    /// Used to force-end combats that exceed MAX_COMBAT_TURNS (prevents OOM in god mode).
+    /// </summary>
+    private int _combatTurnCount;
+
+    /// <summary>
+    /// Maximum combat turns before force-ending. God-mode combats that exceed this
+    /// are force-won (player declared winner) to prevent OOM from growing action queues,
+    /// power lists, and sync context callback accumulation.
+    /// </summary>
+    private const int MAX_COMBAT_TURNS = 50;
+
+    /// <summary>
     /// Global action timeout: no single ExecuteAction call should ever take longer than this.
     /// If exceeded, the engine force-kills the player and returns a game_over to prevent hangs.
     /// Set to 20s to accommodate boss fights which legitimately take longer.
@@ -1076,6 +1104,7 @@ public class RunSimulator
             var runState = _runState;
             Log($"EnterRoom: type={roomType} encounter={encounter} event={eventId}");
             _shopCardRemoved = false;
+            _combatTurnCount = 0;
 
             AbstractRoom room;
             switch (roomType.ToLowerInvariant())
@@ -1176,16 +1205,70 @@ public class RunSimulator
 
             var player = _runState.Players[0];
 
-            // God mode: set HP high enough to survive any hit but not so high
-            // that fights last hundreds of turns and OOM the engine
+            // God mode: restore HP to 9999 so the player survives any hit.
+            // OOM is prevented by the MAX_COMBAT_TURNS limit (force-win after 50 turns)
+            // and periodic queue cleanup, not by limiting HP.
             if (GodMode && player.Creature != null)
             {
                 try
                 {
-                    SetField(player.Creature, "_currentHp", 500);
-                    SetField(player.Creature, "_maxHp", 500);
+                    SetField(player.Creature, "_currentHp", 9999);
+                    SetField(player.Creature, "_maxHp", 9999);
                 }
                 catch { }
+
+                // Force-win long combats to prevent OOM from unbounded action/callback growth
+                if (_combatTurnCount > MAX_COMBAT_TURNS && CombatManager.Instance.IsInProgress)
+                {
+                    Log($"God mode: combat exceeded {MAX_COMBAT_TURNS} turns ({_combatTurnCount}). Force-winning to prevent OOM.");
+                    // Kill all enemies to end combat as a win (rather than killing the player)
+                    try
+                    {
+                        var combatState = CombatManager.Instance.DebugOnlyGetState();
+                        if (combatState != null)
+                        {
+                            foreach (var enemy in combatState.Enemies.Where(e => e != null && e.IsAlive))
+                            {
+                                var hpField = enemy.GetType().GetField("_currentHp", BindingFlags.NonPublic | BindingFlags.Instance)
+                                           ?? enemy.GetType().GetField("<CurrentHp>k__BackingField", BindingFlags.NonPublic | BindingFlags.Instance);
+                                if (hpField != null)
+                                    hpField.SetValue(enemy, 0);
+                                else
+                                {
+                                    var hpProp = enemy.GetType().GetProperty("CurrentHp", BindingFlags.Public | BindingFlags.Instance);
+                                    if (hpProp != null && hpProp.CanWrite)
+                                        hpProp.SetValue(enemy, 0);
+                                }
+                            }
+                        }
+                        _syncCtx.Pump();
+                    }
+                    catch (Exception ex) { Log($"Force-win enemy kill failed: {ex.Message}"); }
+
+                    // Clear accumulated callbacks to free memory
+                    _syncCtx.ClearQueue();
+                    _combatTurnCount = 0;
+
+                    // If enemies didn't die cleanly, fall back to force-killing player
+                    if (CombatManager.Instance.IsInProgress)
+                    {
+                        Log("Force-win: enemies still alive, falling back to force-kill player");
+                        ForceKillPlayer(player);
+                    }
+                    return DetectDecisionPoint();
+                }
+
+                // Periodically clear accumulated sync context callbacks during long combats
+                // to prevent gradual memory growth from abandoned ThreadPool work items
+                if (_combatTurnCount > 0 && _combatTurnCount % 10 == 0)
+                {
+                    var queueSize = _syncCtx.QueueCount;
+                    if (queueSize > 500)
+                    {
+                        Log($"God mode: clearing {queueSize} accumulated sync context callbacks (turn {_combatTurnCount})");
+                        _syncCtx.ClearQueue();
+                    }
+                }
             }
 
             // GLOBAL WATCHDOG: Run the action dispatch with a hard wall-clock timeout.
@@ -1228,6 +1311,15 @@ public class RunSimulator
 
             // GLOBAL TIMEOUT HIT — the action is hung. Force-recover.
             Log($"GLOBAL ACTION TIMEOUT: '{action}' did not complete within {GLOBAL_ACTION_TIMEOUT_MS}ms ({actionTimer.ElapsedMilliseconds}ms elapsed)");
+
+            // Interrupt the stuck action thread. Thread.Interrupt() will cause any
+            // blocking call (Thread.Sleep, WaitHandle.Wait, etc.) to throw
+            // ThreadInterruptedException, which may unstick the thread.
+            try { actionThread.Interrupt(); }
+            catch { }
+
+            // Clear accumulated sync context callbacks that may be contributing to the hang
+            _syncCtx.ClearQueue();
 
             // Force-kill the player to end any stuck combat
             if (CombatManager.Instance.IsInProgress && player.Creature != null && !player.Creature.IsDead)
@@ -1316,6 +1408,7 @@ public class RunSimulator
         _pendingRewards = null;
         _lastKnownHp = player.Creature?.CurrentHp ?? 0;
         _shopCardRemoved = false;
+        _combatTurnCount = 0;
 
         var col = Convert.ToInt32(args["col"]);
         var row = Convert.ToInt32(args["row"]);
@@ -1554,11 +1647,14 @@ public class RunSimulator
             }
         }
 
+        // Track combat duration for OOM prevention
+        _combatTurnCount++;
+
         // Ensure no actions are still running before ending turn
         WaitForActionExecutor(timeoutMs: 2000);
 
         var roundBefore = CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0;
-        Log($"Ending turn (round={roundBefore})");
+        Log($"Ending turn (round={roundBefore}, combatTurn={_combatTurnCount})");
         _turnStarted.Reset();
         _combatEnded.Reset();
 
@@ -1927,7 +2023,16 @@ public class RunSimulator
                 WaitForActionExecutor();
                 return DetectDecisionPoint();
             }
-            if (!task.IsCompleted) task.Wait(2000);
+            if (!task.IsCompleted)
+            {
+                // Pump sync context while waiting to prevent deadlock
+                var waitTimer = Stopwatch.StartNew();
+                while (!task.IsCompleted && waitTimer.ElapsedMilliseconds < 2000)
+                {
+                    _syncCtx.Pump();
+                    Thread.Sleep(5);
+                }
+            }
             _syncCtx.Pump();
             Log($"Removed card for {removal.Cost}g");
             _shopCardRemoved = true;
@@ -2239,7 +2344,16 @@ public class RunSimulator
                     WaitForActionExecutor();
                     return DetectDecisionPoint();
                 }
-                if (!task.IsCompleted) task.Wait(2000);
+                if (!task.IsCompleted)
+                {
+                    // Pump sync context while waiting to prevent deadlock
+                    var waitTimer = Stopwatch.StartNew();
+                    while (!task.IsCompleted && waitTimer.ElapsedMilliseconds < 2000)
+                    {
+                        _syncCtx.Pump();
+                        Thread.Sleep(5);
+                    }
+                }
                 _syncCtx.Pump();
             }
             catch (Exception ex)
@@ -2293,7 +2407,16 @@ public class RunSimulator
                             WaitForActionExecutor();
                             return DetectDecisionPoint();
                         }
-                        if (!task.IsCompleted) task.Wait(2000);
+                        if (!task.IsCompleted)
+                        {
+                            // Pump sync context while waiting to prevent deadlock
+                            var waitTimer = Stopwatch.StartNew();
+                            while (!task.IsCompleted && waitTimer.ElapsedMilliseconds < 2000)
+                            {
+                                _syncCtx.Pump();
+                                Thread.Sleep(5);
+                            }
+                        }
                         _syncCtx.Pump();
                     }
                     catch (Exception ex) { Log($"Event choose: {ex.Message}"); }
