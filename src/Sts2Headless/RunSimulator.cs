@@ -1141,6 +1141,9 @@ public class RunSimulator
             Log("Skipping card reward");
             _pendingCardReward.OnSkipped();
             _pendingCardReward = null;
+            Thread.Sleep(50);
+            _syncCtx.Pump();
+            WaitForActionExecutor();
         }
         // If no cards left but potion rewards remain, also skip those
         // to prevent stuck state (empty cards[] card_reward that can't advance)
