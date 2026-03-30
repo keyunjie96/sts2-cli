@@ -112,8 +112,11 @@ internal class InlineSynchronizationContext : SynchronizationContext
             // Drain any callbacks that were queued while the main callback ran.
             // These are typically async continuations that the main callback is
             // waiting on — executing them here breaks the deadlock.
+            // Limit raised to 500 for Act 2+ enemies with complex on-death chains
+            // (spawning, summoning, status card application) that produce deep
+            // async continuations.
             int innerDrained = 0;
-            while (innerDrained < 100 && !done.IsSet && _queue.TryDequeue(out var item))
+            while (innerDrained < 500 && !done.IsSet && _queue.TryDequeue(out var item))
             {
                 var (cb, st) = item;
                 try
@@ -1430,6 +1433,7 @@ public class RunSimulator
         _lastKnownHp = player.Creature?.CurrentHp ?? 0;
         _shopCardRemoved = false;
         _combatTurnCount = 0;
+        _consecutiveForceStarts = 0;
 
         var col = Convert.ToInt32(args["col"]);
         var row = Convert.ToInt32(args["row"]);
@@ -1718,6 +1722,24 @@ public class RunSimulator
                 if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) { resolved = true; break; }
                 if (_combatEnded.IsSet) { resolved = true; break; }
                 if (CombatManager.Instance.IsPlayPhase) { resolved = true; break; }
+
+                // Act 2 enemy on-death effects (and boss phase transitions) may
+                // trigger card selections during the end-turn async chain. If a
+                // selection is pending, the game is blocked waiting for the agent's
+                // response — pumping further is futile and would waste 8 seconds.
+                // Break out so DetectDecisionPoint can present the selection.
+                if (_cardSelector.HasPending && _cardSelector.PendingOptions != null)
+                {
+                    Log("EndTurn pump: card selection appeared during end-turn processing, breaking");
+                    resolved = true;
+                    break;
+                }
+                if (_cardSelector.HasPendingReward)
+                {
+                    Log("EndTurn pump: card reward appeared during end-turn processing, breaking");
+                    resolved = true;
+                    break;
+                }
 
                 // Wall-clock timeout: if we've been pumping for over 8 seconds,
                 // the async chain is deadlocked. Break out and force-recover.
@@ -2113,6 +2135,18 @@ public class RunSimulator
         _syncCtx.Pump();
         WaitForActionExecutor();
 
+        // After resolving a card selection, the game's async chain may trigger
+        // another card selection (e.g., boss relic reward chains, act transition
+        // events). Give the async chain a brief moment to post the next selection
+        // before we call DetectDecisionPoint. Without this, late-arriving card
+        // selections can deadlock: the async chain blocks on GetSelectedCards,
+        // but DetectDecisionPoint already returned without seeing HasPending.
+        if (!_cardSelector.HasPending && !_cardSelector.HasPendingReward)
+        {
+            Thread.Sleep(50);
+            _syncCtx.Pump();
+        }
+
         // Extra wait for rest-site SMITH: the background ChooseLocalOption task
         // needs time to complete the upgrade after card selection resolves.
         if (_runState?.CurrentRoom is RestSiteRoom)
@@ -2147,6 +2181,14 @@ public class RunSimulator
             _cardSelector.CancelPending();
             _syncCtx.Pump();
             WaitForActionExecutor();
+
+            // Brief wait for late-arriving card selections from the async chain
+            // (same rationale as DoSelectCards — cancelling can trigger follow-up selections)
+            if (!_cardSelector.HasPending && !_cardSelector.HasPendingReward)
+            {
+                Thread.Sleep(50);
+                _syncCtx.Pump();
+            }
         }
         return DetectDecisionPoint();
     }
@@ -2510,6 +2552,22 @@ public class RunSimulator
                     while (!task.IsCompleted && actTimer.ElapsedMilliseconds < 10_000)
                     {
                         _syncCtx.Pump();
+                        // Break if card selection appeared during act transition
+                        if (_cardSelector.HasPending && _cardSelector.PendingOptions != null)
+                        {
+                            Log("DoProceed EnterNextAct: card selection appeared, breaking pump loop");
+                            break;
+                        }
+                        if (_cardSelector.HasPendingReward)
+                        {
+                            Log("DoProceed EnterNextAct: card reward appeared, breaking pump loop");
+                            break;
+                        }
+                        if (_pendingBundles != null)
+                        {
+                            Log("DoProceed EnterNextAct: bundle selection appeared, breaking pump loop");
+                            break;
+                        }
                         Thread.Sleep(10);
                     }
                     YieldPatches.SuppressYield = false;
@@ -2518,7 +2576,7 @@ public class RunSimulator
                         _syncCtx.Pump();
                         WaitForActionExecutor();
                     }
-                    else
+                    else if (!_cardSelector.HasPending && !_cardSelector.HasPendingReward && _pendingBundles == null)
                     {
                         Log($"DoProceed: EnterNextAct timed out after {actTimer.ElapsedMilliseconds}ms");
                         try { _syncCtx.PumpWithTimeout(perCallbackTimeoutMs: 500); } catch { }
@@ -2665,14 +2723,29 @@ public class RunSimulator
             {
                 return DetectPostCombatState(player, combatRoom);
             }
-            // Fallback: brief wait
-            for (int i = 0; i < 20; i++)
+            // Fallback: more aggressive pump loop for Act 2+ complex transitions.
+            // Enemy on-death effects (spawning, summoning, status cards) and boss
+            // phase transitions produce deep async chains that need more time.
+            var fallbackTimer = Stopwatch.StartNew();
+            for (int i = 0; i < 200; i++)
             {
                 _syncCtx.Pump();
-                Thread.Sleep(5);
                 if (CombatManager.Instance.IsPlayPhase) return CombatPlayState(player);
                 if (!CombatManager.Instance.IsInProgress) return DetectPostCombatState(player, combatRoom);
+                if (player.Creature != null && player.Creature.IsDead) return DetectPostCombatState(player, combatRoom);
+                // Re-check for card selections that may have been triggered by death effects
+                if (_cardSelector.HasPending && _cardSelector.PendingOptions != null)
+                    goto checkCardSelect;
+                if (fallbackTimer.ElapsedMilliseconds > 2000)
+                {
+                    Log($"DetectDecisionPoint combat fallback timed out after {fallbackTimer.ElapsedMilliseconds}ms");
+                    break;
+                }
+                Thread.Sleep(5);
             }
+            // Final state check: if combat is no longer in progress, route to post-combat
+            if (!CombatManager.Instance.IsInProgress || (player.Creature != null && player.Creature.IsDead))
+                return DetectPostCombatState(player, combatRoom);
             return CombatPlayState(player);
         }
 
@@ -3146,24 +3219,48 @@ public class RunSimulator
                 // pump with a hard timeout.
                 YieldPatches.SuppressYield = true;
                 var task = RunManager.Instance.EnterNextAct();
-                // Pump while waiting, with a 10s hard timeout
+                // Pump while waiting, with a 10s hard timeout.
+                // Also check for card selections — boss relic rewards or act
+                // transition events may trigger GetSelectedCards which creates
+                // a pending TCS that blocks the async chain until resolved.
                 while (!task.IsCompleted && actTimer.ElapsedMilliseconds < 10_000)
                 {
                     _syncCtx.Pump();
+                    // If a card selection appeared during the act transition,
+                    // break out immediately so DetectDecisionPoint can present it
+                    // to the agent. Continuing to pump would be futile since the
+                    // async chain is blocked on the card selection response.
+                    if (_cardSelector.HasPending && _cardSelector.PendingOptions != null)
+                    {
+                        Log("EnterNextAct: card selection appeared during act transition, breaking pump loop");
+                        break;
+                    }
+                    if (_cardSelector.HasPendingReward)
+                    {
+                        Log("EnterNextAct: card reward appeared during act transition, breaking pump loop");
+                        break;
+                    }
+                    if (_pendingBundles != null)
+                    {
+                        Log("EnterNextAct: bundle selection appeared during act transition, breaking pump loop");
+                        break;
+                    }
                     Thread.Sleep(10);
                 }
                 YieldPatches.SuppressYield = false;
-                if (!task.IsCompleted)
+                if (!task.IsCompleted && !_cardSelector.HasPending && !_cardSelector.HasPendingReward && _pendingBundles == null)
                 {
                     Log($"EnterNextAct timed out after {actTimer.ElapsedMilliseconds}ms — forcing map transition");
                     // Force to map even if EnterNextAct didn't complete
                     try { _syncCtx.PumpWithTimeout(perCallbackTimeoutMs: 500); } catch { }
                 }
-                else
+                else if (task.IsCompleted)
                 {
                     _syncCtx.Pump();
                     WaitForActionExecutor();
                 }
+                // If task is not completed but card selection is pending, that's fine —
+                // DetectDecisionPoint will present the card selection to the agent
             }
             catch (Exception ex) { Log($"EnterNextAct: {ex.Message}"); }
             finally { YieldPatches.SuppressYield = false; }
@@ -4047,7 +4144,11 @@ public class RunSimulator
                 {
                     _syncCtx.Pump();
                     if (!executor.IsRunning) break;
+                    // Break if card selection, reward, or bundle appeared — the executor is
+                    // blocked waiting for user input, no point pumping further.
                     if (_cardSelector.HasPending) break;
+                    if (_cardSelector.HasPendingReward) break;
+                    if (_pendingBundles != null) break;
                     if (timer.ElapsedMilliseconds > timeoutMs)
                     {
                         Log($"WaitForActionExecutor timed out after {timer.ElapsedMilliseconds}ms");
