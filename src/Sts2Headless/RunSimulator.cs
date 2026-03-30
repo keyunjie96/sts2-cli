@@ -329,8 +329,9 @@ internal class LocLookup
     public string PowerDescription(string entry, int amount)
     {
         // Try smartDescription first — it contains {Amount} references for dynamic values
-        var smart = Bilingual("powers", entry + ".smartDescription");
-        if (!IsRawKey(smart))
+        var smartKey = entry + ".smartDescription";
+        var smart = Bilingual("powers", smartKey);
+        if (smart != smartKey && !IsRawKey(smart))
         {
             smart = ResolvePowerTemplates(smart, amount);
             return smart;
@@ -2074,12 +2075,24 @@ public class RunSimulator
                 {
                     var stats = new Dictionary<string, object?>();
                     try { foreach (var dv in card.DynamicVars.Values) stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
+                    var bundleCardDesc = _loc.Bilingual("cards", card.Id.Entry + ".description");
+                    if (stats.Count > 0 && bundleCardDesc.Contains('{'))
+                    {
+                        foreach (var kv in stats)
+                        {
+                            if (kv.Value != null)
+                                bundleCardDesc = System.Text.RegularExpressions.Regex.Replace(bundleCardDesc,
+                                    @"\{" + System.Text.RegularExpressions.Regex.Escape(kv.Key) + @"(?::[^}]*)?\}",
+                                    kv.Value.ToString() ?? "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                        }
+                    }
+                    bundleCardDesc = CleanupDescriptionTemplates(bundleCardDesc);
                     return new Dictionary<string, object?>
                     {
                         ["name"] = _loc.Card(card.Id.Entry),
                         ["cost"] = card.EnergyCost?.GetResolved() ?? 0,
                         ["type"] = card.Type.ToString(),
-                        ["description"] = _loc.Bilingual("cards", card.Id.Entry + ".description"),
+                        ["description"] = bundleCardDesc,
                         ["stats"] = stats.Count > 0 ? stats : null,
                     };
                 }).ToList(),
@@ -2702,12 +2715,14 @@ public class RunSimulator
                 try
                 {
                     var potionModel = pr.Potion;
+                    var prDesc = CleanupDescriptionTemplates(
+                        _loc.Bilingual("potions", (potionModel?.Id.Entry ?? "?") + ".description"));
                     potionRewardsList.Add(new Dictionary<string, object?>
                     {
                         ["index"] = i,
                         ["id"] = potionModel?.Id.Entry,
                         ["name"] = _loc.Potion(potionModel?.Id.Entry ?? "?"),
-                        ["description"] = _loc.Bilingual("potions", (potionModel?.Id.Entry ?? "?") + ".description"),
+                        ["description"] = prDesc,
                     });
                 }
                 catch (Exception ex)
@@ -3144,7 +3159,8 @@ public class RunSimulator
         {
             ["index"] = i,
             ["name"] = _loc.Relic(e.Model?.Id.Entry ?? "?"),
-            ["description"] = _loc.Bilingual("relics", (e.Model?.Id.Entry ?? "?") + ".description"),
+            ["description"] = CleanupDescriptionTemplates(
+                _loc.Bilingual("relics", (e.Model?.Id.Entry ?? "?") + ".description")),
             ["cost"] = e.Cost,
             ["is_stocked"] = e.IsStocked,
         }).ToList();
@@ -3153,7 +3169,8 @@ public class RunSimulator
         {
             ["index"] = i,
             ["name"] = _loc.Potion(e.Model?.Id.Entry ?? "?"),
-            ["description"] = _loc.Bilingual("potions", (e.Model?.Id.Entry ?? "?") + ".description"),
+            ["description"] = CleanupDescriptionTemplates(
+                _loc.Bilingual("potions", (e.Model?.Id.Entry ?? "?") + ".description")),
             ["cost"] = e.Cost,
             ["is_stocked"] = e.IsStocked,
         }).ToList();
@@ -3727,11 +3744,25 @@ public class RunSimulator
             var addedKws = newKws.Except(oldKws).ToList();
             var removedKws = oldKws.Except(newKws).ToList();
 
+            // Resolve upgraded description templates
+            var upgDesc = _loc.Bilingual("cards", card.Id.Entry + ".description");
+            if (stats.Count > 0 && upgDesc.Contains('{'))
+            {
+                foreach (var kv in stats)
+                {
+                    if (kv.Value != null)
+                        upgDesc = System.Text.RegularExpressions.Regex.Replace(upgDesc,
+                            @"\{" + System.Text.RegularExpressions.Regex.Escape(kv.Key) + @"(?::[^}]*)?\}",
+                            kv.Value.ToString() ?? "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                }
+            }
+            upgDesc = CleanupDescriptionTemplates(upgDesc);
+
             return new Dictionary<string, object?>
             {
                 ["cost"] = clone.EnergyCost?.GetResolved() ?? 0,
                 ["stats"] = stats.Count > 0 ? stats : null,
-                ["description"] = _loc.Bilingual("cards", card.Id.Entry + ".description"),
+                ["description"] = upgDesc,
                 ["added_keywords"] = addedKws.Count > 0 ? addedKws : null,
                 ["removed_keywords"] = removedKws.Count > 0 ? removedKws : null,
             };
@@ -3757,11 +3788,24 @@ public class RunSimulator
                 // Derive counter: use the first DynamicVar value if any, else -1 (no counter)
                 int counter = -1;
                 try { if (vars.Count > 0) counter = (int)(vars.Values.First() ?? -1); } catch { }
+                // Resolve relic description templates
+                var relicDesc = _loc.Bilingual("relics", r.Id.Entry + ".description");
+                if (vars.Count > 0 && relicDesc.Contains('{'))
+                {
+                    foreach (var kv in vars)
+                    {
+                        if (kv.Value != null)
+                            relicDesc = System.Text.RegularExpressions.Regex.Replace(relicDesc,
+                                @"\{" + System.Text.RegularExpressions.Regex.Escape(kv.Key) + @"(?::[^}]*)?\}",
+                                kv.Value.ToString() ?? "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    }
+                }
+                relicDesc = CleanupDescriptionTemplates(relicDesc);
                 return new Dictionary<string, object?>
                 {
                     ["id"] = r.Id.Entry,
                     ["name"] = _loc.Relic(r.Id.Entry),
-                    ["description"] = _loc.Bilingual("relics", r.Id.Entry + ".description"),
+                    ["description"] = relicDesc,
                     ["counter"] = counter,
                     ["vars"] = vars.Count > 0 ? vars : null,
                 };
@@ -3771,11 +3815,24 @@ public class RunSimulator
                 if (p == null) return null;
                 var pvars = new Dictionary<string, object?>();
                 try { foreach (var dv in p.DynamicVars.Values.ToList()) pvars[dv.Name] = (int)dv.BaseValue; } catch { }
+                // Resolve potion description templates
+                var potDesc = _loc.Bilingual("potions", p.Id.Entry + ".description");
+                if (pvars.Count > 0 && potDesc.Contains('{'))
+                {
+                    foreach (var kv in pvars)
+                    {
+                        if (kv.Value != null)
+                            potDesc = System.Text.RegularExpressions.Regex.Replace(potDesc,
+                                @"\{" + System.Text.RegularExpressions.Regex.Escape(kv.Key) + @"(?::[^}]*)?\}",
+                                kv.Value.ToString() ?? "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    }
+                }
+                potDesc = CleanupDescriptionTemplates(potDesc);
                 return new Dictionary<string, object?>
                 {
                     ["index"] = i,
                     ["name"] = _loc.Potion(p.Id.Entry),
-                    ["description"] = _loc.Bilingual("potions", p.Id.Entry + ".description"),
+                    ["description"] = potDesc,
                     ["vars"] = pvars.Count > 0 ? pvars : null,
                     ["target_type"] = p.TargetType.ToString(),
                 };
@@ -3786,6 +3843,19 @@ public class RunSimulator
                 var dstats = new Dictionary<string, object?>();
                 try { foreach (var dv in c.DynamicVars.Values.ToList()) dstats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
                 var dkws = c.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToList();
+                // Resolve deck card description templates
+                var deckCardDesc = _loc.Bilingual("cards", c.Id.Entry + ".description");
+                if (dstats.Count > 0 && deckCardDesc.Contains('{'))
+                {
+                    foreach (var kv in dstats)
+                    {
+                        if (kv.Value != null)
+                            deckCardDesc = System.Text.RegularExpressions.Regex.Replace(deckCardDesc,
+                                @"\{" + System.Text.RegularExpressions.Regex.Escape(kv.Key) + @"(?::[^}]*)?\}",
+                                kv.Value.ToString() ?? "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    }
+                }
+                deckCardDesc = CleanupDescriptionTemplates(deckCardDesc);
                 return new Dictionary<string, object?>
                 {
                     ["id"] = c.Id.ToString(),
@@ -3793,7 +3863,7 @@ public class RunSimulator
                     ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
                     ["type"] = c.Type.ToString(),
                     ["upgraded"] = c.IsUpgraded,
-                    ["description"] = _loc.Bilingual("cards", c.Id.Entry + ".description"),
+                    ["description"] = deckCardDesc,
                     ["stats"] = dstats.Count > 0 ? dstats : null,
                     ["keywords"] = dkws?.Count > 0 ? dkws : null,
                     ["after_upgrade"] = GetUpgradedInfo(c),
